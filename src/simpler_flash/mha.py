@@ -12,9 +12,6 @@ try:
     from .flashattention import (
         flash_attn_kvpacked_func,
         flash_attn_qkvpacked_func,
-        # flash_attn_varlen_kvpacked_func,
-        # flash_attn_varlen_qkvpacked_func,
-        # flash_attn_with_kvcache,
     )
 except ModuleNotFoundError as e:
     print(e)
@@ -220,14 +217,18 @@ class SelfAttention(nn.Module):
         softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
         scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
         if key_padding_mask is not None:
-            padding_mask = torch.full((batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device)
+            padding_mask = torch.full(
+                (batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device
+            )
             padding_mask.masked_fill_(key_padding_mask, 0.0)
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
         if causal:
             # "triu_tril_cuda_template" not implemented for 'BFloat16'
             # So we have to construct the mask in float
-            causal_mask = torch.triu(torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1)
+            causal_mask = torch.triu(
+                torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
+            )
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + causal_mask.to(dtype=scores.dtype)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
@@ -281,9 +282,15 @@ class CrossAttention(nn.Module):
             scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
         if causal:
             # causal mask needs to take into account the difference between seqlen_q and seqlen_k
-            row_idx = rearrange(torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1")
+            row_idx = rearrange(
+                torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1"
+            )
             col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
-            sk = seqlen_k if key_padding_mask is None else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+            sk = (
+                seqlen_k
+                if key_padding_mask is None
+                else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+            )
             causal_mask = col_idx > row_idx + sk - seqlen_q
             scores = scores.masked_fill(causal_mask, -10000.0)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
@@ -390,7 +397,9 @@ class MHA(nn.Module):
         self.rotary_emb_dim = rotary_emb_dim
         self.use_flash_attn = use_flash_attn
         if self.use_flash_attn and (flash_attn_kvpacked_func is None):
-            print("you requested flash transformer but it requires the flash package which is not installed")
+            print(
+                "you requested flash transformer but it requires the flash package which is not installed"
+            )
             print("falling back to regular transformer...")
             self.use_flash_attn = False
 
@@ -402,14 +411,18 @@ class MHA(nn.Module):
 
         self.num_heads = num_heads
         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
-        assert self.num_heads % self.num_heads_kv == 0, "num_heads must be divisible by num_heads_kv"
+        assert (
+            self.num_heads % self.num_heads_kv == 0
+        ), "num_heads must be divisible by num_heads_kv"
         assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
         kv_dim = 2 * self.head_dim * self.num_heads_kv
 
         if self.rotary_emb_dim > 0:
-            assert not cross_attn, "MHA with rotary embedding does not support cross-attention yet"
+            assert (
+                not cross_attn
+            ), "MHA with rotary embedding does not support cross-attention yet"
             assert RotaryEmbedding is not None, "rotary_emb is not installed"
             self.rotary_emb = RotaryEmbedding(
                 self.rotary_emb_dim,
@@ -422,25 +435,41 @@ class MHA(nn.Module):
         if fused_bias_fc and FusedDense is None:
             raise ImportError("fused_dense is not installed")
         linear_cls = nn.Linear if not fused_bias_fc else FusedDense
-        linear_resid_cls = LinearResidual if not fused_bias_fc else partial(FusedDense, return_residual=True)
+        linear_resid_cls = (
+            LinearResidual
+            if not fused_bias_fc
+            else partial(FusedDense, return_residual=True)
+        )
         wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
         inner_attn_cls = (
-            partial(FlashSelfAttention, alibi_slopes=alibi_slopes) if self.use_flash_attn else SelfAttention
+            partial(FlashSelfAttention, alibi_slopes=alibi_slopes)
+            if self.use_flash_attn
+            else SelfAttention
         )
         inner_cross_attn_cls = (
-            partial(FlashCrossAttention, alibi_slopes=alibi_slopes) if self.use_flash_attn else CrossAttention
+            partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
+            if self.use_flash_attn
+            else CrossAttention
         )
         if not self.cross_attn:
             self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         else:
-            self.Wq = linear_cls(embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wq = linear_cls(
+                embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs
+            )
             self.Wkv = wqkv_cls(embed_dim, kv_dim, bias=qkv_proj_bias, **factory_kwargs)
         if self.dwconv:
             if self.num_heads_kv == self.num_heads:
-                self.dwconv_qkv = nn.Conv1d(qkv_dim, qkv_dim, kernel_size=3, padding=2, groups=qkv_dim)
+                self.dwconv_qkv = nn.Conv1d(
+                    qkv_dim, qkv_dim, kernel_size=3, padding=2, groups=qkv_dim
+                )
             else:
-                self.dwconv_q = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=2, groups=embed_dim)
-                self.dwconv_kv = nn.Conv1d(kv_dim, kv_dim, kernel_size=3, padding=2, groups=kv_dim)
+                self.dwconv_q = nn.Conv1d(
+                    embed_dim, embed_dim, kernel_size=3, padding=2, groups=embed_dim
+                )
+                self.dwconv_kv = nn.Conv1d(
+                    kv_dim, kv_dim, kernel_size=3, padding=2, groups=kv_dim
+                )
         self.inner_attn = inner_attn_cls(
             causal=causal,
             softmax_scale=softmax_scale,
@@ -449,7 +478,9 @@ class MHA(nn.Module):
         self.inner_cross_attn = inner_cross_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
         )
-        self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
+        self.out_proj = linear_cls(
+            embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs
+        )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
@@ -467,7 +498,9 @@ class MHA(nn.Module):
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
         assert not self.dwconv, "Generation does not support dwconv yet"
-        assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
+        assert (
+            self.layer_idx is not None
+        ), "Generation requires layer_idx in the constructor"
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
     def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
@@ -480,7 +513,9 @@ class MHA(nn.Module):
         assert self.use_flash_attn
         if self.rotary_emb_dim > 0:
             assert self.rotary_emb.scale is None, "This code path does not support xPos"
-            self.rotary_emb._update_cos_sin_cache(inference_params.max_seqlen, device=q.device, dtype=q.dtype)
+            self.rotary_emb._update_cos_sin_cache(
+                inference_params.max_seqlen, device=q.device, dtype=q.dtype
+            )
             rotary_cos, rotary_sin = (
                 self.rotary_emb._cos_cached,
                 self.rotary_emb._sin_cached,
@@ -506,14 +541,20 @@ class MHA(nn.Module):
             cache_seqlens=cache_seqlens,
             softmax_scale=self.inner_cross_attn.softmax_scale,
             causal=self.inner_cross_attn.causal,
-            rotary_interleaved=(self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False),
+            rotary_interleaved=(
+                self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False
+            ),
             alibi_slopes=alibi_slopes,
         )
         return context
 
     def _update_kvcache_attention(self, q, kv, inference_params):
         """Write kv to inference_params, then do attention"""
-        if inference_params.seqlen_offset == 0 or flash_attn_with_kvcache is None or not self.use_flash_attn:
+        if (
+            inference_params.seqlen_offset == 0
+            or flash_attn_with_kvcache is None
+            or not self.use_flash_attn
+        ):
             # TODO: this only uses seqlen_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
             return self.inner_cross_attn(q, kv)
@@ -605,7 +646,9 @@ class MHA(nn.Module):
                 else inference_params.seqlen_offset
             )
         )
-        rotary_max_seqlen = inference_params.max_seqlen if inference_params is not None else None
+        rotary_max_seqlen = (
+            inference_params.max_seqlen if inference_params is not None else None
+        )
         batch, seqlen = x.shape[:2]
         if not self.cross_attn and self.num_heads_kv == self.num_heads:
             assert x_kv is None and mixer_subset is None
@@ -618,7 +661,9 @@ class MHA(nn.Module):
                     self.dwconv_qkv(rearrange(qkv, "b s d -> b d s"))[..., :-2],
                     "b d s -> b s d",
                 ).contiguous()
-            qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
+            qkv = rearrange(
+                qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim
+            )
             if (
                 inference_params is None
                 or inference_params.seqlen_offset == 0
@@ -626,16 +671,24 @@ class MHA(nn.Module):
                 or not self.use_flash_attn
             ):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen)
+                    qkv = self.rotary_emb(
+                        qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
+                        context = torch.utils.checkpoint.checkpoint(
+                            self.inner_attn, qkv, **kwargs
+                        )
                 else:
-                    context = self._update_kvcache_attention(qkv[:, :, 0], qkv[:, :, 1:], inference_params)
+                    context = self._update_kvcache_attention(
+                        qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                    )
             else:
-                context = self._apply_rotary_update_kvcache_attention(qkv[:, :, 0], qkv[:, :, 1:], inference_params)
+                context = self._apply_rotary_update_kvcache_attention(
+                    qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                )
         else:
             if self.cross_attn:
                 if not self.return_residual:
@@ -673,16 +726,22 @@ class MHA(nn.Module):
                 or not self.use_flash_attn
             ):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen)
+                    q, kv = self.rotary_emb(
+                        q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(self.inner_cross_attn, q, kv, **kwargs)
+                        context = torch.utils.checkpoint.checkpoint(
+                            self.inner_cross_attn, q, kv, **kwargs
+                        )
                 else:
                     context = self._update_kvcache_attention(q, kv, inference_params)
             else:
-                context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
+                context = self._apply_rotary_update_kvcache_attention(
+                    q, kv, inference_params
+                )
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
         if return_qkv:
             return out if not self.return_residual else (out, x), qkv
