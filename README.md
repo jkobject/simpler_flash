@@ -27,3 +27,31 @@ pip install simpler_flash
 ```bash
 pip install git+https://github.com/jkobject/simpler_flash.git@main
 ```
+
+## Usage
+
+```python
+
+from simpler_flash import FlashTransformer
+
+
+self.transformer = FlashTransformer(
+    d_model=1024,
+    nhead=16,
+    nlayers=12,
+    dropout=0.1,
+    use_flash_attn=True,
+    num_heads_kv=4, # option to do Grouped Attention
+    checkpointing=True, # option to use checkpointing
+    prenorm=True, # option to use prenorm
+    drop_path_rate=0.1, # option to use drop path
+)
+
+transformer_output = self.transformer(
+    encoding,
+    return_qkv=get_attention_layer, #option to get the q,k,v matrices (to extract attention scores for example)
+    bias=bias if do_bias else None, # option to add attention bias
+    bias_layer=list(range(self.nlayers - 1)), # option to add attention bias to specific layers
+
+)
+```

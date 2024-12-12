@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a new feature for simpler_flash
+description: Propose a new feature for {{ cookiecutter.project_name }}
 labels: enhancement
 body:
   - type: textarea
