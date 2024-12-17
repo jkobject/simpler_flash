@@ -79,9 +79,11 @@ class FlashTransformer(nn.Module):
             NotImplementedError: Raised when an unsupported operation is attempted.
         """
         super(FlashTransformer, self).__init__()
-
+        self.cross_attn = cross_attn
         self.blocks = nn.ModuleList()
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, nlayers)]  # stochastic depth decay rule
+        dpr = [
+            x.item() for x in torch.linspace(0, drop_path_rate, nlayers)
+        ]  # stochastic depth decay rule
 
         for i in range(nlayers):
             mlp = create_mlp_cls(d_model, mlp_ratio, nn.GELU, fused_mlp)
@@ -95,7 +97,7 @@ class FlashTransformer(nn.Module):
                 cross_attn=cross_attn,
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
-                layer_idx=i,
+                layer_idx=i if not cross_attn else i * 2,
             )
             # or use parallelBlock where attn & MLP are done in parallel
             encoder_layers = Block(
@@ -115,6 +117,38 @@ class FlashTransformer(nn.Module):
                 return_residual=return_residual,
             )
             self.blocks.append(encoder_layers)
+            if cross_attn:
+                mlp = create_mlp_cls(d_model, mlp_ratio, nn.GELU, fused_mlp)
+                attention = partial(
+                    MHA,
+                    num_heads=nhead,
+                    num_heads_kv=num_heads_kv,
+                    dropout=dropout,
+                    causal=False,
+                    use_flash_attn=use_flash_attn,
+                    cross_attn=False,
+                    checkpointing=checkpointing,
+                    fused_bias_fc=fused_bias_fc,
+                    layer_idx=i + 1,
+                )
+                # or use parallelBlock where attn & MLP are done in parallel
+                encoder_layers = Block(
+                    d_model,
+                    attention,
+                    mlp,
+                    prenorm=prenorm,
+                    # need to set it here for now although it hinders some performances as it returns the residual and I need to see what to do with it
+                    # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
+                    residual_in_fp32=residual_in_fp32,
+                    sequence_parallel=sequence_parallel,  # for more parallelism
+                    resid_dropout1=dropout,
+                    resid_dropout2=dropout,
+                    drop_path1=dpr[i - 1] if i > 0 else 0.0,
+                    drop_path2=dpr[i],
+                    fused_dropout_add_ln=fused_dropout_add_ln,
+                    return_residual=return_residual,
+                )
+                self.blocks.append(encoder_layers)
 
         self.prenorm = prenorm
         self.dropout = nn.Dropout(p=dropout)
@@ -147,19 +181,25 @@ class FlashTransformer(nn.Module):
     ) -> Tensor:
         residual = None
         qkvs = []
+        if not self.cross_attn and x_kv is not None:
+            raise ValueError("x_kv must be None for self-attention")
         if bias is not None and bias.dim() == 2:
             bias = bias.unsqueeze(0).unsqueeze(0)
         for i, block in enumerate(self.blocks):
+            if self.cross_attn and x_kv is None and i % 2 == 0:
+                continue
             hidden_states = block(
                 hidden_states,
-                x_kv,
+                x_kv if self.cross_attn and i % 2 == 0 else None,
                 residual,
                 return_qkv=(i in return_qkv),
                 bias=bias if i in bias_layer else None,
             )
             if i in return_qkv:
                 qkvs.append(hidden_states[-1])
-                hidden_states, residual = hidden_states[:-1] if self.prenorm else hidden_states
+                hidden_states, residual = (
+                    hidden_states[:-1] if self.prenorm else hidden_states
+                )
             else:
                 hidden_states, residual = hidden_states
         if self.prenorm:
@@ -201,7 +241,9 @@ def _init_weights(module: nn.Module, name: str = ""):
         module.init_weights()
 
 
-def named_apply(fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False) -> nn.Module:
+def named_apply(
+    fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False
+) -> nn.Module:
     if not depth_first and include_root:
         fn(module=module, name=name)
     for child_name, child_module in module.named_children():
