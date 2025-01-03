@@ -711,6 +711,14 @@ class MHA(nn.Module):
                 kv = qkv[..., self.num_heads * self.head_dim :]
             q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
             kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+            if return_qkv:
+                qkv = torch.cat(
+                    [
+                        q.unsqueeze(2),
+                        kv.repeat_interleave(self.num_heads // self.num_heads_kv, dim=3),
+                    ],
+                    dim=2,
+                )
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2],
