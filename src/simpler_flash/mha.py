@@ -16,7 +16,7 @@ try:
 except ModuleNotFoundError as e:
     print(e)
     print("FlashAttention is not installed, not using it..")
-    raise ValueError("FlashAttention is not installed, not using it..")
+    # raise ValueError("FlashAttention is not installed, not using it..") from e
     flash_attn_kvpacked_func = None
     flash_attn_qkvpacked_func = None
 

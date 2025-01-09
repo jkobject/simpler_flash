@@ -31,10 +31,21 @@ dependencies = [
   "torchtext>=0.13",
   "torchvision>=0.13",
 ]
-optional-dependencies.dev = [
-  "pre-commit",
-  "twine>=4.0.2",
+
+dev = [
+    "pytest>=7.4.3",
+    "coverage>=7.3.2",
+    "ruff>=0.6.4",
+    "pytest-cov>=4.1.0",
+    "gitchangelog>=3.0.4",
+    "mkdocs>=1.5.3",
+    "mkdocs-git-revision-date-localized-plugin>=1.0.0",
+    "mkdocstrings>=0.22.0",
+    "mkdocs-git-authors-plugin>=0.4.0",
+    "mkdocs-jupyter>=0.2.0",
+    "mkdocstrings-python>=0.10.0",
 ]
+
 optional-dependencies.doc = [
   "docutils>=0.8,!=0.18.*,!=0.19.*",
   "ipykernel",
@@ -51,10 +62,7 @@ optional-dependencies.doc = [
   "sphinxcontrib-bibtex>=1",
   "sphinxext-opengraph",
 ]
-optional-dependencies.test = [
-  "coverage",
-  "pytest",
-]
+
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://simpler_flash.readthedocs.io/"
 urls.Homepage = "https://github.com/jkobject/simpler_flash"
