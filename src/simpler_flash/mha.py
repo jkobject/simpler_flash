@@ -19,6 +19,13 @@ except ModuleNotFoundError as e:
     flash_attn_kvpacked_func = None
     flash_attn_qkvpacked_func = None
 
+try:
+    from .hyper_attn import HyperAttention
+except ModuleNotFoundError as e:
+    print(e)
+    print("HyperAttention is not working, not using it..")
+    HyperAttention = None
+
 # from .flashattention_triton import attention as triton_attention
 
 flash_attn_varlen_kvpacked_func = None
@@ -360,6 +367,7 @@ class MHA(nn.Module):
         checkpointing: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        hyper_att: bool = False,
     ) -> None:
         """
         MHA Multi-head self-attention and cross-attention
@@ -386,12 +394,14 @@ class MHA(nn.Module):
             use_flash_attn (bool, optional): whether to use FlashAttention. Defaults to False.
             device (torch.device, optional): device. Defaults to None.
             dtype (torch.dtype, optional): dtype. Defaults to None.
+            hyper_att (bool, optional): whether to use hyperattention. Defaults to False.
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
         self.cross_attn = cross_attn
         self.causal = causal
+        self.hyper_att = hyper_att
         self.layer_idx = layer_idx
         self.dwconv = dwconv
         self.rotary_emb_dim = rotary_emb_dim
@@ -418,7 +428,17 @@ class MHA(nn.Module):
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
         kv_dim = 2 * self.head_dim * self.num_heads_kv
-
+        if HyperAttention is not None:
+            self.hyper = HyperAttention(
+                input_dim=self.head_dim,
+                lsh_num_projs=16,
+                block_size=256,
+                sample_size=256,
+                min_seq_len=2048,
+                smooth_block=True,
+            )
+        else:
+            self.hyper = None
         if self.rotary_emb_dim > 0:
             assert (
                 not cross_attn
@@ -631,6 +651,17 @@ class MHA(nn.Module):
             assert key_padding_mask is None
             assert cu_seqlens is None and max_seqlen is None
             assert not self.dwconv
+        if self.hyper_att or (
+            x.shape[1] > 7_000
+            and self.use_flash_attn
+            and x_kv is None
+            and not self.cross_attn
+            and self.hyper is not None
+        ):
+            # using hyperattention
+            hyper_att = True
+        else:
+            hyper_att = False
 
         kwargs = (
             {}  # "cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
@@ -675,12 +706,17 @@ class MHA(nn.Module):
                         qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
                     )
                 if inference_params is None:
-                    if not self.checkpointing:
-                        context = self.inner_attn(qkv, **kwargs)
-                    else:
-                        context = torch.utils.checkpoint.checkpoint(
-                            self.inner_attn, qkv, **kwargs
+                    if hyper_att:
+                        context = self.hyper(
+                            qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], **kwargs
                         )
+                    else:
+                        if not self.checkpointing:
+                            context = self.inner_attn(qkv, **kwargs)
+                        else:
+                            context = torch.utils.checkpoint.checkpoint(
+                                self.inner_attn, qkv, **kwargs
+                            )
                 else:
                     context = self._update_kvcache_attention(
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params

@@ -51,6 +51,7 @@ class FlashTransformer(nn.Module):
         drop_path_rate: float = 0.0,
         use_flash_attn: bool = True,
         weight_init: str = "",
+        hyper_att: bool = False,
     ):
         """
         FlashTransformer a transformer encoder with flash attention.
@@ -98,6 +99,7 @@ class FlashTransformer(nn.Module):
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else i * 2,
+                hyper_att=hyper_att,
             )
             # or use parallelBlock where attn & MLP are done in parallel
             encoder_layers = Block(
@@ -130,6 +132,7 @@ class FlashTransformer(nn.Module):
                     checkpointing=checkpointing,
                     fused_bias_fc=fused_bias_fc,
                     layer_idx=i + 1,
+                    hyper_att=hyper_att,
                 )
                 # or use parallelBlock where attn & MLP are done in parallel
                 encoder_layers = Block(

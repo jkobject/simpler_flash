@@ -97,7 +97,9 @@ class Block(nn.Module):
 
         if self.fused_dropout_add_ln:
             assert layer_norm_fn is not None, "Triton is not installed"
-            assert isinstance(self.norm1, (nn.LayerNorm, RMSNorm)) and isinstance(self.dropout1, nn.Dropout)
+            assert isinstance(self.norm1, (nn.LayerNorm, RMSNorm)) and isinstance(
+                self.dropout1, nn.Dropout
+            )
 
         # TD [2023-01-07]: TODO: During training, if sequence_parallel is False and dropout != 0.0,
         # then the input to each worker in the tensor parallel group will be different.
@@ -121,7 +123,9 @@ class Block(nn.Module):
                     p._shared_params = True
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+        return self.mixer.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype, **kwargs
+        )
 
     def set_seq_parallel(self, val: bool):
         for p in self.norm1.parameters():
@@ -237,6 +241,7 @@ class Block(nn.Module):
                         residual_in_fp32=self.residual_in_fp32,
                         is_rms_norm=isinstance(self.norm2, RMSNorm),
                     )
+
                 hidden_states = self.mlp(hidden_states)
             return (
                 (hidden_states, residual)
@@ -264,7 +269,9 @@ class Block(nn.Module):
                 mixer_out, hidden_states = mixer_out
             if not self.fused_dropout_add_ln:
                 hidden_states = self.norm1(
-                    (self.drop_path1(self.dropout1(mixer_out)) + hidden_states).to(dtype=self.norm1.weight.dtype)
+                    (self.drop_path1(self.dropout1(mixer_out)) + hidden_states).to(
+                        dtype=self.norm1.weight.dtype
+                    )
                 )
             else:
                 if self.drop_path1.p == 0 or not self.training:
@@ -294,7 +301,9 @@ class Block(nn.Module):
                     mlp_out, hidden_states = mlp_out
                 if not self.fused_dropout_add_ln:
                     hidden_states = self.norm2(
-                        (self.drop_path2(self.dropout2(mlp_out)) + hidden_states).to(dtype=self.norm2.weight.dtype)
+                        (self.drop_path2(self.dropout2(mlp_out)) + hidden_states).to(
+                            dtype=self.norm2.weight.dtype
+                        )
                     )
                 else:
                     if self.drop_path2.p == 0 or not self.training:

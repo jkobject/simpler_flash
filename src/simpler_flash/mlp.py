@@ -37,13 +37,17 @@ class Mlp(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         out_features = out_features if out_features is not None else in_features
-        hidden_features = hidden_features if hidden_features is not None else in_features * 4
+        hidden_features = (
+            hidden_features if hidden_features is not None else in_features * 4
+        )
         self.return_residual = return_residual
         self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1, **factory_kwargs)
         self.activation = activation
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the MLP.
 
