@@ -1202,9 +1202,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         qkv, o, lse, bias = ctx.saved_tensors
-        assert not ctx.needs_input_grad[1], (
-            "FlashAttention does not support bias gradient yet"
-        )
+        assert not ctx.needs_input_grad[
+            1
+        ], "FlashAttention does not support bias gradient yet"
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():
@@ -1273,9 +1273,9 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     def backward(ctx, do):
         q, kv, o, lse, bias = ctx.saved_tensors
         if len(ctx.needs_input_grad) >= 3:
-            assert not ctx.needs_input_grad[2], (
-                "FlashAttention does not support bias gradient yet"
-            )
+            assert not ctx.needs_input_grad[
+                2
+            ], "FlashAttention does not support bias gradient yet"
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():
@@ -1336,14 +1336,14 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
-        return o
+        return o, lse
 
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, lse, bias = ctx.saved_tensors
-        assert not ctx.needs_input_grad[3], (
-            "FlashAttention does not support bias gradient yet"
-        )
+        assert not ctx.needs_input_grad[
+            3
+        ], "FlashAttention does not support bias gradient yet"
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():

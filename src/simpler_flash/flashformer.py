@@ -1,6 +1,7 @@
 import os
 import sys
 from collections.abc import Callable
+from typing import Optional
 from functools import partial
 
 import torch
@@ -49,8 +50,9 @@ class FlashTransformer(nn.Module):
         fused_bias_fc: bool = False,
         sequence_parallel: bool = False,
         drop_path_rate: float = 0.0,
-        use_flash_attn: bool = True,
+        attn_type: str = "flash",
         weight_init: str = "",
+        nb_features: Optional[int] = None,
     ):
         """
         FlashTransformer a transformer encoder with flash attention.
@@ -72,6 +74,7 @@ class FlashTransformer(nn.Module):
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
             drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
             weight_init (str, optional): The weight initialization method. Defaults to "".
+            nb_features (int, optional): The number of features to use for performer. Defaults to None.
 
         Raises
         ------
@@ -93,11 +96,12 @@ class FlashTransformer(nn.Module):
                 num_heads_kv=num_heads_kv,
                 dropout=dropout,
                 causal=False,
-                use_flash_attn=use_flash_attn,
+                attn_type=attn_type,
                 cross_attn=cross_attn,
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else i * 2,
+                nb_features=nb_features,
             )
             # or use parallelBlock where attn & MLP are done in parallel
             encoder_layers = Block(
@@ -125,11 +129,12 @@ class FlashTransformer(nn.Module):
                     num_heads_kv=num_heads_kv,
                     dropout=dropout,
                     causal=False,
-                    use_flash_attn=use_flash_attn,
+                    attn_type=attn_type,
                     cross_attn=False,
                     checkpointing=checkpointing,
                     fused_bias_fc=fused_bias_fc,
                     layer_idx=i + 1,
+                    nb_features=nb_features,
                 )
                 # or use parallelBlock where attn & MLP are done in parallel
                 encoder_layers = Block(

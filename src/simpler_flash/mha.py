@@ -2,11 +2,12 @@
 
 import math
 from functools import partial
-from typing import Any
+from typing import Any, Optional, Callable
 
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
+from .hyper_attention import HyperAttention
 
 try:
     from .flashattention import (
@@ -29,6 +30,57 @@ FusedDense = None
 RotaryEmbedding = None
 
 
+class HyperSelfAttention(nn.Module):
+    def __init__(
+        self,
+        causal: bool = False,
+        softmax_scale: float | None = None,
+        attention_dropout: float = 0.0,
+        head_dim: int = 64,
+        lsh_num_projs: int = 8,
+        block_size: int = 128,
+    ):
+        super().__init__()
+        self.causal = causal
+        self.hyper_attention = HyperAttention(
+            input_dim=head_dim,
+            lsh_num_projs=lsh_num_projs,
+            block_size=block_size,
+            sample_size=128,
+            min_seq_len=2400,
+            smooth_block=True,
+        )
+
+    def forward(self, qkv, bias=None):
+        q, k, v = qkv[:, :, 0, :, :], qkv[:, :, 1, :, :], qkv[:, :, 2, :, :]
+        return self.hyper_attention(q, k, v)
+
+
+class HyperCrossAttention(nn.Module):
+    def __init__(
+        self,
+        causal: bool = False,
+        softmax_scale: float | None = None,
+        attention_dropout: float = 0.0,
+        head_dim: int = 64,
+        lsh_num_projs: int = 8,
+        block_size: int = 128,
+    ):
+        super().__init__()
+        self.hyper_attention = HyperAttention(
+            input_dim=head_dim,
+            lsh_num_projs=lsh_num_projs,
+            block_size=block_size,
+            sample_size=128,
+            min_seq_len=4800,
+            smooth_block=True,
+        )
+
+    def forward(self, q, kv, bias=None):
+        q, k, v = qkv[:, :, 0, :, :], qkv[:, :, 1, :, :], qkv[:, :, 2, :, :]
+        return self.hyper_attention(q, k, v)
+
+
 class FlashSelfAttention(nn.Module):
     def __init__(
         self,
@@ -37,7 +89,7 @@ class FlashSelfAttention(nn.Module):
         attention_dropout: float = 0.0,
         alibi_slopes: Any | None = None,
         deterministic: bool = False,
-        use_triton: bool = False,
+        use_triton: bool = True,
     ):
         """Implement the scaled dot product attention with softmax.
 
@@ -88,18 +140,10 @@ class FlashSelfAttention(nn.Module):
         assert qkv.dtype in [torch.float16, torch.bfloat16]
         assert qkv.is_cuda
         causal = self.causal if causal is None else causal
-        if self.use_triton:
+        if not self.use_triton:
             raise NotImplementedError("OpenAI's flashattention is not implemented")
-            if qkv.stride(-1) != 1:
-                qkv = qkv.contiguous()
-            # return triton_attention(
-            #    qkv[:, :, 0],
-            #    qkv[:, :, 1],
-            #    qkv[:, :, 2],
-            #    bias,
-            #    causal,
-            #    self.softmax_scale,
-            # )
+            # if qkv.stride(-1) != 1:
+            #    qkv = qkv.contiguous()
         else:
             return flash_attn_qkvpacked_func(
                 qkv,
@@ -118,6 +162,7 @@ class FlashCrossAttention(nn.Module):
         attention_dropout=0.0,
         alibi_slopes=None,
         deterministic=False,
+        use_triton: bool = True,
     ):
         """
         Implement the scaled dot product attention with softmax.
@@ -137,6 +182,7 @@ class FlashCrossAttention(nn.Module):
         self.drop = nn.Dropout(attention_dropout)
         self.register_buffer("alibi_slopes", alibi_slopes, persistent=False)
         self.deterministic = deterministic
+        self.use_triton = use_triton
 
     def forward(
         self,
@@ -356,11 +402,13 @@ class MHA(nn.Module):
         rotary_emb_interleaved: bool = False,
         use_alibi: bool = False,
         fused_bias_fc: bool = False,
-        use_flash_attn: bool = False,
+        attn_type: str = "flash",
         return_residual: bool = False,
         checkpointing: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        num_lsh_projections: int = 8,
+        block_size: int = 128,
     ) -> None:
         """
         MHA Multi-head self-attention and cross-attention
@@ -384,9 +432,11 @@ class MHA(nn.Module):
             layer_idx (int, optional): layer index for inference cache. Defaults to None.
             dwconv (bool, optional): whether to use depthwise convolution. Defaults to False.
             fused_bias_fc (bool, optional): whether to use fused_bias_fc. Defaults to False.
-            use_flash_attn (bool, optional): whether to use FlashAttention. Defaults to False.
+            attn_type (str, optional): whether to use FlashAttention. Defaults to "flash".
             device (torch.device, optional): device. Defaults to None.
             dtype (torch.dtype, optional): dtype. Defaults to None.
+            num_lsh_projs (int, optional): number of LSH projections in HyperAttention. Defaults to 8.
+            block_size (int, optional): block size for LSH in HyperAttention. Defaults to 128.
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -396,13 +446,13 @@ class MHA(nn.Module):
         self.layer_idx = layer_idx
         self.dwconv = dwconv
         self.rotary_emb_dim = rotary_emb_dim
-        self.use_flash_attn = use_flash_attn
-        if self.use_flash_attn and (flash_attn_kvpacked_func is None):
+        self.attn_type = attn_type
+        if self.attn_type == "flash" and (flash_attn_kvpacked_func is None):
             print(
                 "you requested flash transformer but it requires the flash package which is not installed"
             )
             print("falling back to regular transformer...")
-            self.use_flash_attn = False
+            self.attn_type = "normal"
 
             # NOT flash transformer using the special tritton kernel
             # or parallelMHA (add the process group thing and faster)
@@ -442,16 +492,29 @@ class MHA(nn.Module):
             else partial(FusedDense, return_residual=True)
         )
         wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
-        inner_attn_cls = (
-            partial(FlashSelfAttention, alibi_slopes=alibi_slopes)
-            if self.use_flash_attn
-            else SelfAttention
-        )
-        inner_cross_attn_cls = (
-            partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
-            if self.use_flash_attn
-            else CrossAttention
-        )
+
+        inner_attn_cls = SelfAttention
+        if self.attn_type == "flash":
+            inner_attn_cls = partial(FlashSelfAttention, alibi_slopes=alibi_slopes)
+        elif self.attn_type == "hyper":
+            inner_attn_cls = partial(
+                HyperSelfAttention,
+                head_dim=self.head_dim,
+                block_size=block_size,
+                lsh_num_projs=num_lsh_projs,
+            )
+
+        inner_cross_attn_cls = CrossAttention
+        if self.attn_type == "flash":
+            inner_cross_attn_cls = partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
+        elif self.attn_type == "hyper":
+            inner_cross_attn_cls = partial(
+                HyperCrossAttention,
+                head_dim=self.head_dim,
+                block_size=block_size,
+                lsh_num_projs=num_lsh_projs,
+            )
+
         if not self.cross_attn:
             self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         else:
@@ -511,7 +574,7 @@ class MHA(nn.Module):
         kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
         assert inference_params is not None and inference_params.seqlen_offset > 0
-        assert self.use_flash_attn
+        assert self.attn_type == "flash"
         if self.rotary_emb_dim > 0:
             assert self.rotary_emb.scale is None, "This code path does not support xPos"
             self.rotary_emb._update_cos_sin_cache(
@@ -554,7 +617,7 @@ class MHA(nn.Module):
         if (
             inference_params.seqlen_offset == 0
             or flash_attn_with_kvcache is None
-            or not self.use_flash_attn
+            or not self.attn_type == "flash"
         ):
             # TODO: this only uses seqlen_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
@@ -621,13 +684,13 @@ class MHA(nn.Module):
         if cu_seqlens is not None:
             assert max_seqlen is not None
             assert key_padding_mask is None
-            assert self.use_flash_attn
+            assert self.attn_type == "flash"
             assert not self.dwconv
             assert self.rotary_emb_dim == 0
         if key_padding_mask is not None:
             assert cu_seqlens is None
             assert max_seqlen is None
-            assert not self.use_flash_attn
+            assert not self.attn_type == "flash"
         if inference_params is not None:
             assert key_padding_mask is None
             assert cu_seqlens is None and max_seqlen is None
@@ -635,7 +698,7 @@ class MHA(nn.Module):
 
         kwargs = (
             {}  # "cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
-            if self.use_flash_attn
+            if self.attn_type != "normal"
             else {"key_padding_mask": key_padding_mask, **kwargs}
         )
         seqlen_offset = (
@@ -669,7 +732,7 @@ class MHA(nn.Module):
                 inference_params is None
                 or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
-                or not self.use_flash_attn
+                or not self.attn_type == "flash"
             ):
                 if self.rotary_emb_dim > 0:
                     qkv = self.rotary_emb(
@@ -732,7 +795,7 @@ class MHA(nn.Module):
                 inference_params is None
                 or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
-                or not self.use_flash_attn
+                or not self.attn_type == "flash"
             ):
                 if self.rotary_emb_dim > 0:
                     q, kv = self.rotary_emb(
