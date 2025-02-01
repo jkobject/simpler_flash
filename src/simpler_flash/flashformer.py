@@ -52,7 +52,7 @@ class FlashTransformer(nn.Module):
         drop_path_rate: float = 0.0,
         attn_type: str = "flash",
         weight_init: str = "",
-        nb_features: Optional[int] = None,
+        **mha_kwargs,
     ):
         """
         FlashTransformer a transformer encoder with flash attention.
@@ -74,7 +74,6 @@ class FlashTransformer(nn.Module):
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
             drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
             weight_init (str, optional): The weight initialization method. Defaults to "".
-            nb_features (int, optional): The number of features to use for performer. Defaults to None.
 
         Raises
         ------
@@ -101,7 +100,7 @@ class FlashTransformer(nn.Module):
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else i * 2,
-                nb_features=nb_features,
+                **mha_kwargs,
             )
             # or use parallelBlock where attn & MLP are done in parallel
             encoder_layers = Block(
@@ -134,7 +133,7 @@ class FlashTransformer(nn.Module):
                     checkpointing=checkpointing,
                     fused_bias_fc=fused_bias_fc,
                     layer_idx=i + 1,
-                    nb_features=nb_features,
+                    **mha_kwargs,
                 )
                 # or use parallelBlock where attn & MLP are done in parallel
                 encoder_layers = Block(
