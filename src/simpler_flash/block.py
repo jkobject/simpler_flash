@@ -37,6 +37,7 @@ class Block(nn.Module):
         residual_in_fp32: bool = False,
         sequence_parallel: bool = False,
         mark_shared_params: bool = False,
+        cross_attn: Callable | None = None,
     ):
         """
         For prenorm=True, this Block has a slightly different structure compared to a regular
@@ -73,6 +74,7 @@ class Block(nn.Module):
             sequence_parallel (bool, optional): whether to use sequence parallelism. Defaults to False.
             mark_shared_params (bool, optional): whether to mark the norm parameters as "shared_params".
                 This is useful when we want to sync the norm parameters across workers. Defaults to False.
+            cross_attn (Optional[Callable], optional): an additional attention layer for cross-attention. Defaults to None.
         """
         super().__init__()
         self.prenorm = prenorm
@@ -86,6 +88,13 @@ class Block(nn.Module):
         if mlp_cls is None:
             mlp_cls = partial(Mlp, hidden_features=4 * dim)
         self.mixer = mixer_cls(dim)
+        if cross_attn:
+            self.cross_attn = cross_attn(dim)
+            self.dropout3 = dropout_cls(resid_dropout1)
+            self.drop_path3 = StochasticDepth(drop_path1, mode="row")
+            self.norm3 = norm_cls(dim)
+        else:
+            self.cross_attn = None
         self.dropout1 = dropout_cls(resid_dropout1)
         self.drop_path1 = StochasticDepth(drop_path1, mode="row")
         self.norm1 = norm_cls(dim)
@@ -97,7 +106,9 @@ class Block(nn.Module):
 
         if self.fused_dropout_add_ln:
             assert layer_norm_fn is not None, "Triton is not installed"
-            assert isinstance(self.norm1, (nn.LayerNorm, RMSNorm)) and isinstance(self.dropout1, nn.Dropout)
+            assert isinstance(self.norm1, (nn.LayerNorm, RMSNorm)) and isinstance(
+                self.dropout1, nn.Dropout
+            )
 
         # TD [2023-01-07]: TODO: During training, if sequence_parallel is False and dropout != 0.0,
         # then the input to each worker in the tensor parallel group will be different.
@@ -121,7 +132,9 @@ class Block(nn.Module):
                     p._shared_params = True
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+        return self.mixer.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype, **kwargs
+        )
 
     def set_seq_parallel(self, val: bool):
         for p in self.norm1.parameters():
@@ -195,9 +208,46 @@ class Block(nn.Module):
                 mixer_kwargs = {}
             if mixer_subset is not None:
                 mixer_kwargs["mixer_subset"] = mixer_subset
+            if self.cross_attn and x_kv is not None:
+                hidden_states = self.cross_attn(
+                    hidden_states,
+                    x_kv=x_kv,
+                    return_qkv=False,
+                    bias=None,
+                    **mixer_kwargs,
+                )
+                if not self.fused_dropout_add_ln:
+                    dropped = self.drop_path3(self.dropout3(hidden_states))
+                    residual = (dropped + residual) if residual is not None else dropped
+                    hidden_states = self.norm3(residual.to(dtype=self.norm3.weight.dtype))
+                    if self.residual_in_fp32:
+                        residual = residual.to(torch.float32)
+                else:
+                    if self.drop_path3.p == 0 or not self.training:
+                        rowscale3 = None
+                    else:
+                        rowscale3 = self.drop_path3(
+                            torch.ones(
+                                hidden_states.shape[:-1],
+                                device=hidden_states.device,
+                                dtype=hidden_states.dtype,
+                            )
+                        )
+                    hidden_states, residual = layer_norm_fn(
+                        hidden_states,
+                        self.norm3.weight,
+                        self.norm3.bias,
+                        residual=residual,
+                        eps=self.norm3.eps,
+                        dropout_p=self.dropout3.p if self.training else 0.0,
+                        rowscale=rowscale3,
+                        prenorm=True,
+                        residual_in_fp32=self.residual_in_fp32,
+                        is_rms_norm=isinstance(self.norm3, RMSNorm),
+                    )
             hidden_states = self.mixer(
                 hidden_states,
-                x_kv=x_kv,
+                x_kv=None,
                 return_qkv=return_qkv,
                 bias=bias,
                 **mixer_kwargs,
@@ -264,7 +314,9 @@ class Block(nn.Module):
                 mixer_out, hidden_states = mixer_out
             if not self.fused_dropout_add_ln:
                 hidden_states = self.norm1(
-                    (self.drop_path1(self.dropout1(mixer_out)) + hidden_states).to(dtype=self.norm1.weight.dtype)
+                    (self.drop_path1(self.dropout1(mixer_out)) + hidden_states).to(
+                        dtype=self.norm1.weight.dtype
+                    )
                 )
             else:
                 if self.drop_path1.p == 0 or not self.training:
@@ -294,7 +346,9 @@ class Block(nn.Module):
                     mlp_out, hidden_states = mlp_out
                 if not self.fused_dropout_add_ln:
                     hidden_states = self.norm2(
-                        (self.drop_path2(self.dropout2(mlp_out)) + hidden_states).to(dtype=self.norm2.weight.dtype)
+                        (self.drop_path2(self.dropout2(mlp_out)) + hidden_states).to(
+                            dtype=self.norm2.weight.dtype
+                        )
                     )
                 else:
                     if self.drop_path2.p == 0 or not self.training:
