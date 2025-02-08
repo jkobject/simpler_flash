@@ -89,19 +89,6 @@ class FlashTransformer(nn.Module):
 
         for i in range(nlayers):
             mlp = create_mlp_cls(d_model, mlp_ratio, nn.GELU, fused_mlp)
-            attention = partial(
-                MHA,
-                num_heads=nhead,
-                num_heads_kv=num_heads_kv,
-                dropout=dropout,
-                causal=False,
-                attn_type=attn_type,
-                cross_attn=cross_attn,
-                checkpointing=checkpointing,
-                fused_bias_fc=fused_bias_fc,
-                layer_idx=i if not cross_attn else i * 2,
-                **mha_kwargs,
-            )
             if cross_attn:
                 cross_attention = partial(
                     MHA,
@@ -110,11 +97,24 @@ class FlashTransformer(nn.Module):
                     dropout=dropout,
                     causal=False,
                     attn_type=attn_type,
-                    layer_idx=(i * 2) + 1,
-                    cross_attn=False,
+                    layer_idx=(i * 2),
+                    cross_attn=True,
                 )
             else:
                 cross_attention = None
+            attention = partial(
+                MHA,
+                num_heads=nhead,
+                num_heads_kv=num_heads_kv,
+                dropout=dropout,
+                causal=False,
+                attn_type=attn_type,
+                cross_attn=False,
+                checkpointing=checkpointing,
+                fused_bias_fc=fused_bias_fc,
+                layer_idx=i if not cross_attn else (i * 2) + 1,
+                **mha_kwargs,
+            )
             # or use parallelBlock where attn & MLP are done in parallel
             encoder_layers = Block(
                 d_model,
