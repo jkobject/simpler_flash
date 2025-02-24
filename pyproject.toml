@@ -20,16 +20,21 @@ requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
   "einops>=0.6.1",
+  "performer-pytorch>=1",
+
   # for debug logging (referenced from the issue template)
   "session-info",
   "torch==2.2",
-  "torchaudio>=0.13",
+  "torchaudio>=2.2",
   "torchdata>=0.5",
-  "torchtext>=0.13",
-  "torchvision>=0.13",
+  "torchtext>=0.17",
+  "torchvision>=0.17",
 ]
 
 optional-dependencies.doc = [
