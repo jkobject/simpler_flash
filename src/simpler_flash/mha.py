@@ -77,7 +77,7 @@ class HyperCrossAttention(nn.Module):
         )
 
     def forward(self, q, kv, bias=None):
-        q, k, v = qkv[:, :, 0, :, :], qkv[:, :, 1, :, :], qkv[:, :, 2, :, :]
+        k, v = kv[:, :, 0, :, :], kv[:, :, 1, :, :]
         return self.hyper_attention(q, k, v)
 
 
@@ -247,6 +247,7 @@ class SelfAttention(nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
+        self.dropout = attention_dropout
 
     def forward(self, qkv, causal=None, key_padding_mask=None, bias=None):
         """
@@ -258,30 +259,39 @@ class SelfAttention(nn.Module):
             key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
                 False means to mask out. (B, S)
         """
-        batch_size, seqlen = qkv.shape[0], qkv.shape[1]
+        # batch_size, seqlen = qkv.shape[0], qkv.shape[1]
         causal = self.causal if causal is None else causal
         q, k, v = qkv.unbind(dim=2)
-        softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-        if key_padding_mask is not None:
-            padding_mask = torch.full(
-                (batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device
-            )
-            padding_mask.masked_fill_(key_padding_mask, 0.0)
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
-        if causal:
-            # "triu_tril_cuda_template" not implemented for 'BFloat16'
-            # So we have to construct the mask in float
-            causal_mask = torch.triu(
-                torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
-            )
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + causal_mask.to(dtype=scores.dtype)
-        attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
-        attention_drop = self.drop(attention)
-        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        output = nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=key_padding_mask,
+            dropout_p=self.dropout,
+            is_causal=causal,
+        )
         return output
+        # softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+        # scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+        # if key_padding_mask is not None:
+        #    padding_mask = torch.full(
+        #        (batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device
+        #    )
+        #    padding_mask.masked_fill_(key_padding_mask, 0.0)
+        #    # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+        #    scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+        # if causal:
+        #    # "triu_tril_cuda_template" not implemented for 'BFloat16'
+        #    # So we have to construct the mask in float
+        #    causal_mask = torch.triu(
+        #        torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
+        #    )
+        #    # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+        #    scores = scores + causal_mask.to(dtype=scores.dtype)
+        # attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
+        # attention_drop = self.drop(attention)
+        # output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+        # return output
 
 
 class CrossAttention(nn.Module):
@@ -409,6 +419,7 @@ class MHA(nn.Module):
         dtype: torch.dtype | None = None,
         num_lsh_projections: int = 8,
         block_size: int = 128,
+        sketcher_dim: int = 128,
     ) -> None:
         """
         MHA Multi-head self-attention and cross-attention
@@ -433,10 +444,15 @@ class MHA(nn.Module):
             dwconv (bool, optional): whether to use depthwise convolution. Defaults to False.
             fused_bias_fc (bool, optional): whether to use fused_bias_fc. Defaults to False.
             attn_type (str, optional): whether to use FlashAttention. Defaults to "flash".
+                - "flash": Use flash attention.
+                - "normal": Use regular MHA attention.
+                - "hyper": Use HyperAttention.
+                - "criss-cross": Use Criss-Cross attention.
             device (torch.device, optional): device. Defaults to None.
             dtype (torch.dtype, optional): dtype. Defaults to None.
-            num_lsh_projs (int, optional): number of LSH projections in HyperAttention. Defaults to 8.
+            num_lsh_projections (int, optional): number of LSH projections in HyperAttention. Defaults to 8.
             block_size (int, optional): block size for LSH in HyperAttention. Defaults to 128.
+            sketcher_dim (int, optional): dimension of the sketcher. Defaults to 128.
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -501,9 +517,8 @@ class MHA(nn.Module):
                 HyperSelfAttention,
                 head_dim=self.head_dim,
                 block_size=block_size,
-                lsh_num_projs=num_lsh_projs,
+                lsh_num_projs=num_lsh_projections,
             )
-
         inner_cross_attn_cls = CrossAttention
         if self.attn_type == "flash":
             inner_cross_attn_cls = partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
@@ -512,7 +527,7 @@ class MHA(nn.Module):
                 HyperCrossAttention,
                 head_dim=self.head_dim,
                 block_size=block_size,
-                lsh_num_projs=num_lsh_projs,
+                lsh_num_projs=num_lsh_projections,
             )
 
         if not self.cross_attn:
@@ -534,6 +549,8 @@ class MHA(nn.Module):
                 self.dwconv_kv = nn.Conv1d(
                     kv_dim, kv_dim, kernel_size=3, padding=2, groups=kv_dim
                 )
+        if self.attn_type == "criss-cross":
+            self.Wqkv_criss_cross = wqkv_cls(sketcher_dim, qkv_dim, **factory_kwargs)
         self.inner_attn = inner_attn_cls(
             causal=causal,
             softmax_scale=softmax_scale,
@@ -542,6 +559,16 @@ class MHA(nn.Module):
         self.inner_cross_attn = inner_cross_attn_cls(
             causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
         )
+        if self.attn_type == "criss-cross":
+            self.inner_criss_cross_attn = inner_cross_attn_cls(
+                causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
+            )
+            self.out_criss_cross = linear_cls(
+                embed_dim,
+                sketcher_dim,
+                bias=out_proj_bias,
+                **factory_kwargs,
+            )
         self.out_proj = linear_cls(
             embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs
         )
@@ -660,7 +687,7 @@ class MHA(nn.Module):
             x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if
                 cu_seqlens is None and max_seqlen is None, else (total, hidden_dim) where total
                 is the is the sum of the sequence lengths in the batch.
-            x_kv: (batch, seqlen, hidden_dim), only applicable for cross-attention. If None, use x.
+            x_kv: (batch, seqlen, hidden_dim), only applicable for cross-attention or criss-cross attention.If None, use x.
             cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
                 of the sequences in the batch, used to index into x. Only applicable when using
                 FlashAttention.
@@ -714,7 +741,11 @@ class MHA(nn.Module):
             inference_params.max_seqlen if inference_params is not None else None
         )
         batch, seqlen = x.shape[:2]
-        if not self.cross_attn and self.num_heads_kv == self.num_heads:
+        if (
+            not self.cross_attn
+            and self.num_heads_kv == self.num_heads
+            and self.attn_type != "criss-cross"
+        ):
             assert x_kv is None and mixer_subset is None
             if not self.return_residual:
                 qkv = self.Wqkv(x)  # .to(torch.float16, device="cuda")
@@ -765,23 +796,27 @@ class MHA(nn.Module):
                         kv, x = self.Wkv(x)
                     q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
             else:
-                assert self.num_heads_kv != self.num_heads
                 if not self.return_residual:
                     qkv = self.Wqkv(x)
                 else:
                     qkv, x = self.Wqkv(x)
                 q = qkv[..., : self.num_heads * self.head_dim]
                 kv = qkv[..., self.num_heads * self.head_dim :]
+                if self.attn_type == "criss-cross":
+                    cc_qkv = self.Wqkv_criss_cross(x_kv)
+                    cc_q = cc_qkv[..., : self.num_heads * self.head_dim]
+                    cc_kv = cc_qkv[..., self.num_heads * self.head_dim :]
+                    cc_q = rearrange(cc_q, "... (h d) -> ... h d", d=self.head_dim)
+                    cc_kv = rearrange(
+                        cc_kv,
+                        "... (two hkv d) -> ... two hkv d",
+                        two=2,
+                        d=self.head_dim,
+                    )
             q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
             kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
-            if return_qkv:
-                qkv = torch.cat(
-                    [
-                        q.unsqueeze(2),
-                        kv.repeat_interleave(self.num_heads // self.num_heads_kv, dim=3),
-                    ],
-                    dim=2,
-                )
+            # TODO: to change for criss-cross
+
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2],
@@ -791,6 +826,15 @@ class MHA(nn.Module):
                     self.dwconv_kv(rearrange(kv, "b s d -> b d s"))[..., :-2],
                     "b d s -> b s d",
                 ).contiguous()
+                if self.attn_type == "criss-cross":
+                    cc_q = rearrange(
+                        self.dwconv_q(rearrange(cc_q, "b s d -> b d s"))[..., :-2],
+                        "b d s -> b s d",
+                    ).contiguous()
+                    cc_kv = rearrange(
+                        self.dwconv_kv(rearrange(cc_kv, "b s d -> b d s"))[..., :-2],
+                        "b d s -> b s d",
+                    ).contiguous()
             if (
                 inference_params is None
                 or inference_params.seqlen_offset == 0
@@ -803,10 +847,21 @@ class MHA(nn.Module):
                     )
                 if inference_params is None:
                     if not self.checkpointing:
-                        context = self.inner_cross_attn(q, kv, **kwargs)
+                        if self.attn_type == "criss-cross":
+                            cc_context = self.inner_criss_cross_attn(cc_q, kv, **kwargs)
+                        context = self.inner_cross_attn(
+                            q,
+                            kv if self.attn_type != "criss-cross" else cc_kv,
+                            **kwargs,
+                        )
                     else:
+                        if self.attn_type == "criss-cross":
+                            cc_context = self.inner_criss_cross_attn(cc_q, kv, **kwargs)
                         context = torch.utils.checkpoint.checkpoint(
-                            self.inner_cross_attn, q, kv, **kwargs
+                            self.inner_cross_attn,
+                            q,
+                            kv if self.attn_type != "criss-cross" else cc_kv,
+                            **kwargs,
                         )
                 else:
                     context = self._update_kvcache_attention(q, kv, inference_params)
@@ -814,7 +869,28 @@ class MHA(nn.Module):
                 context = self._apply_rotary_update_kvcache_attention(
                     q, kv, inference_params
                 )
+            if return_qkv:
+                qkv = torch.cat(
+                    [
+                        q.unsqueeze(2),
+                        kv.repeat_interleave(self.num_heads // self.num_heads_kv, dim=3),
+                    ],
+                    dim=2,
+                )
+                #    [
+                #        torch.cat([q, cc_q], dim=1).unsqueeze(2),
+                #        torch.cat([kv, cc_kv], dim=1).repeat_interleave(
+                #            self.num_heads // self.num_heads_kv, dim=3
+                #        ),
+                #    ],
+                #    dim=2,
+                # )
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
+        if self.attn_type == "criss-cross":
+            out = (
+                out,
+                self.out_criss_cross(rearrange(cc_context, "... h d -> ... (h d)")),
+            )
         if return_qkv:
             return out if not self.return_residual else (out, x), qkv
         else:

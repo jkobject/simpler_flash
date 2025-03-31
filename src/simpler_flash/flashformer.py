@@ -12,7 +12,7 @@ from torchvision.ops import StochasticDepth
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
-from . import MHA, Block, Mlp  # noqa: E402
+from . import MHA, Block, Mlp, RMSNorm  # noqa: E402
 
 try:
     from .layer_norm import layer_norm_fn
@@ -44,7 +44,6 @@ class FlashTransformer(nn.Module):
         checkpointing: bool = False,
         fused_dropout_add_ln: bool = False,
         return_residual: bool = False,
-        prenorm: bool = True,
         mlp_ratio: float = 4.0,
         fused_mlp: bool = False,
         fused_bias_fc: bool = False,
@@ -52,6 +51,8 @@ class FlashTransformer(nn.Module):
         drop_path_rate: float = 0.0,
         attn_type: str = "flash",
         weight_init: str = "",
+        sketcher_size: int = 200,
+        sketcher_dim: int = 128,
         **mha_kwargs,
     ):
         """
@@ -67,13 +68,19 @@ class FlashTransformer(nn.Module):
             checkpointing (bool, optional): Whether to use gradient checkpointing. Defaults to False.
             fused_dropout_add_ln (bool, optional): Whether to fuse dropout, addition and layer normalization operations. Defaults to False.
             return_residual (bool, optional): Whether to return the residual. Defaults to False.
-            prenorm (bool, optional): Whether to use pre-normalization. Defaults to True.
             mlp_ratio (float, optional): The ratio for MLP. Defaults to 4.0.
             fused_mlp (bool, optional): Whether to use fused MLP. Defaults to False.
             fused_bias_fc (bool, optional): Whether to fuse bias and fully connected layers. Defaults to False.
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
             drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
+            attn_type (str, optional): The attention type. Defaults to "flash".
+                - "flash": Use flash attention.
+                - "normal": Use regular MHA attention.
+                - "hyper": Use HyperAttention.
+                - "criss-cross": Use Criss-Cross attention.
             weight_init (str, optional): The weight initialization method. Defaults to "".
+            sketcher_size (int, optional): The size of the sketcher. Defaults to 200.
+            sketcher_dim (int, optional): The dimension of the sketcher. Defaults to 128.
 
         Raises
         ------
@@ -82,7 +89,13 @@ class FlashTransformer(nn.Module):
         """
         super(FlashTransformer, self).__init__()
         self.cross_attn = cross_attn
+        self.attn_type = attn_type
         self.blocks = nn.ModuleList()
+        if attn_type == "criss-cross":
+            self.sketcher_size = sketcher_size
+            self.learnt_latent = nn.Embedding(
+                num_embeddings=sketcher_size, embedding_dim=sketcher_dim
+            )
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, nlayers)
         ]  # stochastic depth decay rule
@@ -113,6 +126,7 @@ class FlashTransformer(nn.Module):
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else (i * 2) + 1,
+                sketcher_dim=sketcher_dim,
                 **mha_kwargs,
             )
             # or use parallelBlock where attn & MLP are done in parallel
@@ -120,7 +134,6 @@ class FlashTransformer(nn.Module):
                 d_model,
                 attention,
                 mlp,
-                prenorm=prenorm,
                 # need to set it here for now although it hinders some performances as it returns the residual and I need to see what to do with it
                 # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
                 residual_in_fp32=residual_in_fp32,
@@ -132,10 +145,10 @@ class FlashTransformer(nn.Module):
                 fused_dropout_add_ln=fused_dropout_add_ln,
                 return_residual=return_residual,
                 cross_attn=cross_attention,
+                sketcher_dim=sketcher_dim,
             )
             self.blocks.append(encoder_layers)
 
-        self.prenorm = prenorm
         self.dropout = nn.Dropout(p=dropout)
         self.drop_path = StochasticDepth(p=dpr[-1], mode="row")
         self.norm = torch.nn.LayerNorm(d_model, eps=1e-6)
@@ -158,11 +171,11 @@ class FlashTransformer(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        x_kv: Tensor | None = None,
-        mask: Tensor | None = None,
+        x_kv: Optional[Tensor] = None,
         return_qkv=[],
-        bias: torch.Tensor = None,
+        bias: Optional[Tensor] = None,
         bias_layer=[],
+        mask_zeros: Optional[Tensor] = None,
     ) -> Tensor:
         residual = None
         qkvs = []
@@ -170,6 +183,12 @@ class FlashTransformer(nn.Module):
             raise ValueError("x_kv must be None for self-attention")
         if bias is not None and bias.dim() == 2:
             bias = bias.unsqueeze(0).unsqueeze(0)
+        if self.attn_type == "criss-cross":
+            x_kv = self.learnt_latent(
+                torch.arange(
+                    self.sketcher_size, dtype=torch.long, device=hidden_states.device
+                ).repeat(hidden_states.shape[0], 1)
+            )
         for i, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
@@ -177,40 +196,41 @@ class FlashTransformer(nn.Module):
                 residual,
                 return_qkv=(i in return_qkv),
                 bias=bias if i in bias_layer else None,
+                src_key_padding_mask=mask_zeros,
             )
             if i in return_qkv:
                 qkvs.append(hidden_states[-1])
-                hidden_states, residual = (
-                    hidden_states[:-1] if self.prenorm else hidden_states
-                )
+                hidden_states, residual = hidden_states[:-1]
             else:
                 hidden_states, residual = hidden_states
-        if self.prenorm:
-            if not self.fused_dropout_add_ln:
-                residual = self.drop_path(self.dropout(hidden_states)) + residual
-                hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            if self.attn_type == "criss-cross":
+                x_kv = x_kv + hidden_states[1]
+                hidden_states = hidden_states[0]
+        if not self.fused_dropout_add_ln:
+            residual = self.drop_path(self.dropout(hidden_states)) + residual
+            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+        else:
+            if self.drop_path.p == 0 or not self.training:
+                rowscale = None
             else:
-                if self.drop_path.p == 0 or not self.training:
-                    rowscale = None
-                else:
-                    rowscale = self.drop_path(
-                        torch.ones(
-                            hidden_states.shape[:-1],
-                            device=hidden_states.device,
-                            dtype=hidden_states.dtype,
-                        )
+                rowscale = self.drop_path(
+                    torch.ones(
+                        hidden_states.shape[:-1],
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
                     )
-                # Set prenorm=False here since we don't need to the residual
-                hidden_states = layer_norm_fn(
-                    hidden_states,
-                    self.norm.weight,
-                    self.norm.bias,
-                    residual=residual,
-                    eps=self.norm.eps,
-                    dropout_p=self.dropout.p if self.training else 0.0,
-                    rowscale=rowscale,
-                    prenorm=False,
                 )
+            # Set prenorm=False here since we don't need to the residual
+            hidden_states = layer_norm_fn(
+                hidden_states,
+                self.norm.weight,
+                self.norm.bias,
+                residual=residual,
+                eps=self.norm.eps,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                rowscale=rowscale,
+                prenorm=False,
+            )
         return hidden_states if len(return_qkv) == 0 else (hidden_states, qkvs)
 
 

@@ -1339,7 +1339,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return o, lse
 
     @staticmethod
-    def backward(ctx, do):
+    def backward(ctx, do, dlse_use_needed=None):
         q, k, v, o, lse, bias = ctx.saved_tensors
         assert not ctx.needs_input_grad[
             3

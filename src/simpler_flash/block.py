@@ -27,7 +27,6 @@ class Block(nn.Module):
         mlp_cls: Callable | None = None,
         norm_cls: Callable = partial(nn.LayerNorm, eps=1e-6),
         dropout_cls: type[nn.Dropout] = nn.Dropout,
-        prenorm: bool = True,
         resid_dropout1: float = 0.0,
         resid_dropout2: float = 0.0,
         drop_path1: float = 0.0,
@@ -37,11 +36,10 @@ class Block(nn.Module):
         residual_in_fp32: bool = False,
         sequence_parallel: bool = False,
         mark_shared_params: bool = False,
-        cross_attn: Callable | None = None,
+        cross_attn: str | None = None,
+        sketcher_dim: int = 128,
     ):
         """
-        For prenorm=True, this Block has a slightly different structure compared to a regular
-        prenorm Transformer block.
         The standard block is: LN -> MHA -> Dropout -> Add -> LN -> MLP -> Dropout -> Add.
         [Ref: https://arxiv.org/abs/2002.04745]
         Here we have: Dropout -> Add -> LN -> MHA -> Dropout -> Add -> LN -> MLP, returning both
@@ -49,7 +47,6 @@ class Block(nn.Module):
         This is for performance reasons, as we can fuse the dropout, add and LayerNorm.
         The residual needs to be provided (except for the very first block).
 
-        For prenorm=False, this Block has the same structure as a regular postnorm Transformer
         block: MHA -> Dropout -> Add -> LN -> MLP -> Dropout -> Add -> LN.
 
         Args:
@@ -58,7 +55,6 @@ class Block(nn.Module):
             mlp_cls (Optional[Callable], optional): the class to use for the mlp layer. Defaults to None.
             norm_cls (Callable, optional): the class to use for the layer norm. Defaults to partial(nn.LayerNorm, eps=1e-6).
             dropout_cls (Type[nn.Dropout], optional): the class to use for the dropout. Defaults to nn.Dropout.
-            prenorm (bool, optional): whether to use pre-norm or post-norm. Defaults to True.
             resid_dropout1 (float, optional): the dropout probability for the first dropout layer. Defaults to 0.0.
             resid_dropout2 (float, optional): the dropout probability for the second dropout layer. Defaults to 0.0.
             drop_path1 (float, optional): the drop path probability for the first drop path layer. Defaults to 0.0.
@@ -75,20 +71,22 @@ class Block(nn.Module):
             mark_shared_params (bool, optional): whether to mark the norm parameters as "shared_params".
                 This is useful when we want to sync the norm parameters across workers. Defaults to False.
             cross_attn (Optional[Callable], optional): an additional attention layer for cross-attention. Defaults to None.
+            sketcher_dim (int, optional): the dimension of the sketcher. Defaults to 128.
         """
         super().__init__()
-        self.prenorm = prenorm
         self.fused_dropout_add_ln = fused_dropout_add_ln
         self.return_residual = return_residual
         self.residual_in_fp32 = residual_in_fp32
-        if self.residual_in_fp32:
-            assert self.prenorm, "residual_in_fp32 is only compatible with prenorm=True"
         if mixer_cls is None:
             mixer_cls = partial(MHA, num_heads=dim // 64)
         if mlp_cls is None:
             mlp_cls = partial(Mlp, hidden_features=4 * dim)
         self.mixer = mixer_cls(dim)
         if cross_attn:
+            if self.mixer.attn_type == "criss-cross":
+                raise NotImplementedError(
+                    "Criss-cross attention is not implemented for self-attention"
+                )
             self.cross_attn = cross_attn(dim)
             self.dropout3 = dropout_cls(resid_dropout1)
             self.drop_path3 = StochasticDepth(drop_path1, mode="row")
@@ -103,6 +101,8 @@ class Block(nn.Module):
             self.dropout2 = dropout_cls(resid_dropout2)
             self.drop_path2 = StochasticDepth(drop_path2, mode="row")
             self.norm2 = norm_cls(dim)
+            if self.mixer.attn_type == "criss-cross":
+                self.norm_cc = norm_cls(sketcher_dim)
 
         if self.fused_dropout_add_ln:
             assert layer_norm_fn is not None, "Triton is not installed"
@@ -123,12 +123,18 @@ class Block(nn.Module):
             if hasattr(self, "norm2"):
                 for p in self.norm2.parameters():
                     p._sequence_parallel = True
+            if hasattr(self, "norm_cc"):
+                for p in self.norm_cc.parameters():
+                    p._sequence_parallel = True
         # Mark the norm parameters as "shared_params" so that we sync their values at init.
         if mark_shared_params:
             for p in self.norm1.parameters():
                 p._shared_params = True
             if hasattr(self, "norm2"):
                 for p in self.norm2.parameters():
+                    p._shared_params = True
+            if hasattr(self, "norm_cc"):
+                for p in self.norm_cc.parameters():
                     p._shared_params = True
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -142,6 +148,9 @@ class Block(nn.Module):
         if hasattr(self, "norm2"):
             for p in self.norm2.parameters():
                 p._sequence_parallel = val
+        if hasattr(self, "norm_cc"):
+            for p in self.norm_cc.parameters():
+                p._sequence_parallel = val
 
     def forward(
         self,
@@ -149,7 +158,6 @@ class Block(nn.Module):
         x_kv: Tensor | None = None,
         residual: Tensor | None = None,
         bias: Tensor | None = None,
-        src_mask: Tensor | None = None,
         is_causal: bool | None = None,
         src_key_padding_mask: Tensor | None = None,
         mixer_subset: Tensor | None = None,
@@ -161,7 +169,6 @@ class Block(nn.Module):
         Args:
             hidden_states (Tensor): The sequence to be passed to the encoder layer. This is a required argument.
             residual (Optional[Tensor]): This argument is used differently based on the normalization method.
-                If postnorm is used, residual should be None. If prenorm is used, hidden_states is updated as Attn/MLP(LN(residual)).
             mixer_subset: This argument is used only for cross-attention.
                 If not None, a subset of the input sequence 'x' is taken before applying the query projection.
                 This is particularly useful for models like ViT where only the CLS token in the last layer is of interest.
@@ -174,18 +181,74 @@ class Block(nn.Module):
             Tensor or Tuple[Tensor, Tensor]: The output tensor of the encoder layer.
             If return_qkv is True, the function will return a tuple of the output tensor and the query, key, and value tensors.
         """
-        if self.prenorm:
+        if not self.fused_dropout_add_ln:
+            dropped = self.drop_path1(self.dropout1(hidden_states))
+            residual = (dropped + residual) if residual is not None else dropped
+            hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
+            if self.mixer.attn_type == "criss-cross":
+                x_kv = self.norm_cc(x_kv.to(dtype=self.norm_cc.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            if self.drop_path1.p == 0 or not self.training:
+                rowscale1 = None
+            else:
+                rowscale1 = self.drop_path1(
+                    torch.ones(
+                        hidden_states.shape[:-1],
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+                )
+            hidden_states, residual = layer_norm_fn(
+                hidden_states,
+                self.norm1.weight,
+                self.norm1.bias,
+                residual=residual,
+                eps=self.norm1.eps,
+                dropout_p=self.dropout1.p if self.training else 0.0,
+                rowscale=rowscale1,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                is_rms_norm=isinstance(self.norm1, RMSNorm),
+            )
+            if self.mixer.attn_type == "criss-cross":
+                x_kv = layer_norm_fn(
+                    x_kv,
+                    self.norm_cc.weight,
+                    self.norm_cc.bias,
+                    residual=None,
+                    eps=self.norm_cc.eps,
+                    dropout_p=0.0,
+                    rowscale=None,
+                    prenorm=False,
+                    residual_in_fp32=self.residual_in_fp32,
+                    is_rms_norm=isinstance(self.norm_cc, RMSNorm),
+                )
+        if mixer_kwargs is None:
+            mixer_kwargs = {}
+        if mixer_subset is not None:
+            mixer_kwargs["mixer_subset"] = mixer_subset
+        if self.cross_attn and x_kv is not None:
+            hidden_states = self.cross_attn(
+                hidden_states,
+                x_kv=x_kv,
+                return_qkv=False,
+                bias=None,
+                key_padding_mask=src_key_padding_mask,
+                **mixer_kwargs,
+            )
             if not self.fused_dropout_add_ln:
-                dropped = self.drop_path1(self.dropout1(hidden_states))
+                dropped = self.drop_path3(self.dropout3(hidden_states))
                 residual = (dropped + residual) if residual is not None else dropped
-                hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
+                hidden_states = self.norm3(residual.to(dtype=self.norm3.weight.dtype))
                 if self.residual_in_fp32:
                     residual = residual.to(torch.float32)
             else:
-                if self.drop_path1.p == 0 or not self.training:
-                    rowscale1 = None
+                if self.drop_path3.p == 0 or not self.training:
+                    rowscale3 = None
                 else:
-                    rowscale1 = self.drop_path1(
+                    rowscale3 = self.drop_path3(
                         torch.ones(
                             hidden_states.shape[:-1],
                             device=hidden_states.device,
@@ -194,182 +257,73 @@ class Block(nn.Module):
                     )
                 hidden_states, residual = layer_norm_fn(
                     hidden_states,
-                    self.norm1.weight,
-                    self.norm1.bias,
+                    self.norm3.weight,
+                    self.norm3.bias,
                     residual=residual,
-                    eps=self.norm1.eps,
-                    dropout_p=self.dropout1.p if self.training else 0.0,
-                    rowscale=rowscale1,
+                    eps=self.norm3.eps,
+                    dropout_p=self.dropout3.p if self.training else 0.0,
+                    rowscale=rowscale3,
                     prenorm=True,
                     residual_in_fp32=self.residual_in_fp32,
-                    is_rms_norm=isinstance(self.norm1, RMSNorm),
+                    is_rms_norm=isinstance(self.norm3, RMSNorm),
                 )
-            if mixer_kwargs is None:
-                mixer_kwargs = {}
-            if mixer_subset is not None:
-                mixer_kwargs["mixer_subset"] = mixer_subset
-            if self.cross_attn and x_kv is not None:
-                hidden_states = self.cross_attn(
-                    hidden_states,
-                    x_kv=x_kv,
-                    return_qkv=False,
-                    bias=None,
-                    **mixer_kwargs,
-                )
-                if not self.fused_dropout_add_ln:
-                    dropped = self.drop_path3(self.dropout3(hidden_states))
-                    residual = (dropped + residual) if residual is not None else dropped
-                    hidden_states = self.norm3(residual.to(dtype=self.norm3.weight.dtype))
-                    if self.residual_in_fp32:
-                        residual = residual.to(torch.float32)
-                else:
-                    if self.drop_path3.p == 0 or not self.training:
-                        rowscale3 = None
-                    else:
-                        rowscale3 = self.drop_path3(
-                            torch.ones(
-                                hidden_states.shape[:-1],
-                                device=hidden_states.device,
-                                dtype=hidden_states.dtype,
-                            )
-                        )
-                    hidden_states, residual = layer_norm_fn(
-                        hidden_states,
-                        self.norm3.weight,
-                        self.norm3.bias,
-                        residual=residual,
-                        eps=self.norm3.eps,
-                        dropout_p=self.dropout3.p if self.training else 0.0,
-                        rowscale=rowscale3,
-                        prenorm=True,
-                        residual_in_fp32=self.residual_in_fp32,
-                        is_rms_norm=isinstance(self.norm3, RMSNorm),
-                    )
-            hidden_states = self.mixer(
-                hidden_states,
-                x_kv=None,
-                return_qkv=return_qkv,
-                bias=bias,
-                **mixer_kwargs,
-            )
-            if return_qkv:
-                qkv = hidden_states[1]
-                hidden_states = hidden_states[0]
-            if mixer_subset is not None:
-                residual = residual[:, mixer_subset]
-            if not isinstance(self.mlp, nn.Identity):
-                if not self.fused_dropout_add_ln:
-                    dropped = self.drop_path2(self.dropout2(hidden_states))
-                    residual = (dropped + residual) if residual is not None else dropped
-                    hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
-                    if self.residual_in_fp32:
-                        residual = residual.to(torch.float32)
-                else:
-                    if self.drop_path2.p == 0 or not self.training:
-                        rowscale2 = None
-                    else:
-                        rowscale2 = self.drop_path2(
-                            torch.ones(
-                                hidden_states.shape[:-1],
-                                device=hidden_states.device,
-                                dtype=hidden_states.dtype,
-                            )
-                        )
-                    hidden_states, residual = layer_norm_fn(
-                        hidden_states,
-                        self.norm2.weight,
-                        self.norm2.bias,
-                        residual=residual,
-                        eps=self.norm2.eps,
-                        dropout_p=self.dropout2.p if self.training else 0.0,
-                        rowscale=rowscale2,
-                        prenorm=True,
-                        residual_in_fp32=self.residual_in_fp32,
-                        is_rms_norm=isinstance(self.norm2, RMSNorm),
-                    )
-                hidden_states = self.mlp(hidden_states)
-            return (
-                (hidden_states, residual)
-                if not return_qkv
-                else (
-                    hidden_states,
-                    residual,
-                    qkv,
-                )
-            )
-        # if not prenorm (disregard for scPRINT)
-        else:
-            assert residual is None
-            mixer_out = self.mixer(
-                hidden_states,
-                x_kv=x_kv,
-                return_qkv=return_qkv,
-                bias=bias,
-                **(mixer_kwargs if mixer_kwargs is not None else {}),
-            )
-            if return_qkv:
-                qkv = mixer_out[-1]
-                mixer_out = mixer_out[:-1]
-            if self.return_residual:  # mixer out is actually a pair here
-                mixer_out, hidden_states = mixer_out
+        hidden_states = self.mixer(
+            hidden_states,
+            x_kv=x_kv if self.mixer.attn_type == "criss-cross" else None,
+            return_qkv=return_qkv,
+            bias=bias,
+            key_padding_mask=src_key_padding_mask,
+            **mixer_kwargs,
+        )
+        if return_qkv:
+            qkv = hidden_states[1]
+            hidden_states = hidden_states[0]
+        if mixer_subset is not None:
+            residual = residual[:, mixer_subset]
+        if self.mixer.attn_type == "criss-cross":
+            x_kv = hidden_states[1]
+            hidden_states = hidden_states[0]
+        if not isinstance(self.mlp, nn.Identity):
             if not self.fused_dropout_add_ln:
-                hidden_states = self.norm1(
-                    (self.drop_path1(self.dropout1(mixer_out)) + hidden_states).to(
-                        dtype=self.norm1.weight.dtype
-                    )
-                )
+                dropped = self.drop_path2(self.dropout2(hidden_states))
+                residual = (dropped + residual) if residual is not None else dropped
+                hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
+                if self.residual_in_fp32:
+                    residual = residual.to(torch.float32)
+
             else:
-                if self.drop_path1.p == 0 or not self.training:
-                    rowscale1 = None
+                if self.drop_path2.p == 0 or not self.training:
+                    rowscale2 = None
                 else:
-                    rowscale1 = self.drop_path1(
+                    rowscale2 = self.drop_path2(
                         torch.ones(
-                            mixer_out.shape[:-1],
-                            device=mixer_out.device,
-                            dtype=mixer_out.dtype,
+                            hidden_states.shape[:-1],
+                            device=hidden_states.device,
+                            dtype=hidden_states.dtype,
                         )
                     )
-                hidden_states = layer_norm_fn(
-                    mixer_out,
-                    self.norm1.weight,
-                    self.norm1.bias,
-                    residual=hidden_states,
-                    eps=self.norm1.eps,
-                    dropout_p=self.dropout1.p if self.training else 0.0,
-                    rowscale=rowscale1,
-                    prenorm=False,
-                    is_rms_norm=isinstance(self.norm1, RMSNorm),
+                hidden_states, residual = layer_norm_fn(
+                    hidden_states,
+                    self.norm2.weight,
+                    self.norm2.bias,
+                    residual=residual,
+                    eps=self.norm2.eps,
+                    dropout_p=self.dropout2.p if self.training else 0.0,
+                    rowscale=rowscale2,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    is_rms_norm=isinstance(self.norm2, RMSNorm),
                 )
-            if not isinstance(self.mlp, nn.Identity):
-                mlp_out = self.mlp(hidden_states)
-                if self.return_residual:  # mlp out is actually a pair here
-                    mlp_out, hidden_states = mlp_out
-                if not self.fused_dropout_add_ln:
-                    hidden_states = self.norm2(
-                        (self.drop_path2(self.dropout2(mlp_out)) + hidden_states).to(
-                            dtype=self.norm2.weight.dtype
-                        )
-                    )
-                else:
-                    if self.drop_path2.p == 0 or not self.training:
-                        rowscale2 = None
-                    else:
-                        rowscale2 = self.drop_path2(
-                            torch.ones(
-                                mlp_out.shape[:-1],
-                                device=mlp_out.device,
-                                dtype=mlp_out.dtype,
-                            )
-                        )
-                    hidden_states = layer_norm_fn(
-                        mlp_out,
-                        self.norm2.weight,
-                        self.norm2.bias,
-                        residual=hidden_states,
-                        eps=self.norm2.eps,
-                        dropout_p=self.dropout2.p if self.training else 0.0,
-                        rowscale=rowscale2,
-                        prenorm=False,
-                        is_rms_norm=isinstance(self.norm2, RMSNorm),
-                    )
-            return hidden_states if not return_qkv else (hidden_states, qkv)
+            # maybe in the future add a criss-cross mlp and don't forget to add the residual connection
+            hidden_states = self.mlp(hidden_states)
+            if self.mixer.attn_type == "criss-cross":
+                hidden_states = (hidden_states, x_kv)
+        return (
+            (hidden_states, residual)
+            if not return_qkv
+            else (
+                hidden_states,
+                residual,
+                qkv,
+            )
+        )

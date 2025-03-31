@@ -75,16 +75,13 @@ class HyperAttention(torch.nn.Module):
         """
         batch_size, n_query, head_size, dim = query.shape
         if self.min_seq_len > n_query:
-            import pdb
-
-            pdb.set_trace()
             attn, lse = flash_attn_func(
                 query,
                 key,
                 value,
                 None,
                 False,
-                scale,
+                None,
             )
         else:
             # Hash keys and queries via SortLSH and obtain buckets
