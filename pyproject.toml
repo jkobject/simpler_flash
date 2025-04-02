@@ -3,7 +3,7 @@ build-backend = "hatchling.build"
 requires = [ "hatchling" ]
 
 [project]
-name = "simpler-flash"
+name = "simpler_flash"
 version = "0.0.1"
 description = "a simpler version of flashattention"
 readme = "README.md"
@@ -25,7 +25,7 @@ classifiers = [
 dependencies = [
   "anndata",
   # for debug logging (referenced from the issue template)
-  "session-info",
+  "session-info2",
 ]
 optional-dependencies.dev = [
   "pre-commit",
@@ -37,7 +37,7 @@ optional-dependencies.doc = [
   "ipython",
   "myst-nb>=1.1",
   "pandas",
-  # Until pybtex >0.23.0 releases: https://bitbucket.org/pybtex-devs/pybtex/issues/169/
+  # Until pybtex >0.24.0 releases: https://bitbucket.org/pybtex-devs/pybtex/issues/169/
   "setuptools",
   "sphinx>=4",
   "sphinx-autodoc-typehints",
@@ -74,6 +74,8 @@ line-length = 120
 src = [ "src" ]
 extend-include = [ "*.ipynb" ]
 
+format.docstring-code-format = true
+
 lint.select = [
   "B",      # flake8-bugbear
   "BLE",    # flake8-blind-except
@@ -88,29 +90,19 @@ lint.select = [
   "W",      # Warning detected by Pycodestyle
 ]
 lint.ignore = [
-  "B006", #
   "B008", # Errors from function calls in argument defaults. These are fine when the result is immutable.
   "D100", # Missing docstring in public module
-  "D101", # Missing docstring in public class
-  "D102", # Missing docstring in public function
-  "D103", # Missing docstring in public class member
   "D104", # Missing docstring in public package
   "D105", # __magic__ methods are often self-explanatory, allow missing docstrings
   "D107", # Missing docstring in __init__
-  "D200", # one line docstrings are fine
   # Disable one in each pair of mutually incompatible rules
-  "D203",  # We don't want a blank line before a class docstring
-  "D205",  # Missing docstring in public method
-  "D213",  # <> We want docstrings to start immediately after the opening triple quote
-  "D400",  # first line should end with a period [Bug: doesn't work with single-line docstrings]
-  "D401",  # First line should be in imperative mood; try rephrasing
-  "E501",  # line too long -> we accept long comment lines; formatter gets rid of long code lines
-  "E731",  # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
-  "E741",  # allow I, O, l as variable names -> I is the identity matrix
-  "F403",  #
-  "UP008", #
-  "UP027",
-  "UP038", #
+  "D203", # We don’t want a blank line before a class docstring
+  "D213", # <> We want docstrings to start immediately after the opening triple quote
+  "D400", # first line should end with a period [Bug: doesn’t work with single-line docstrings]
+  "D401", # First line should be in imperative mood; try rephrasing
+  "E501", # line too long -> we accept long comment lines; formatter gets rid of long code lines
+  "E731", # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
+  "E741", # allow I, O, l as variable names -> I is the identity matrix
 ]
 lint.per-file-ignores."*/__init__.py" = [ "F401" ]
 lint.per-file-ignores."docs/*" = [ "I" ]
