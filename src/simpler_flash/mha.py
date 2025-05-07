@@ -170,7 +170,7 @@ class FlashSelfAttention(nn.Module):
                     bias,
                     causal,
                     self.softmax_scale,
-                    self.attention_dropout,
+                    # self.attention_dropout,
                 )
 
 
@@ -259,7 +259,7 @@ class FlashCrossAttention(nn.Module):
                 None,
                 causal,
                 self.softmax_scale,
-                self.attention_dropout,
+                # self.attention_dropout,
             )
 
 
