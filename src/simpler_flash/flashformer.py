@@ -53,6 +53,8 @@ class FlashTransformer(nn.Module):
         weight_init: str = "",
         sketcher_size: int = 200,
         sketcher_dim: int = 128,
+        cross_dim: int = 128,
+        softpick: bool = False,
         **mha_kwargs,
     ):
         """
@@ -71,6 +73,7 @@ class FlashTransformer(nn.Module):
             mlp_ratio (float, optional): The ratio for MLP. Defaults to 4.0.
             fused_mlp (bool, optional): Whether to use fused MLP. Defaults to False.
             fused_bias_fc (bool, optional): Whether to fuse bias and fully connected layers. Defaults to False.
+            cross_dim (int, optional): The dimension of the cross-attention. Defaults to 128.
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
             drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
             attn_type (str, optional): The attention type. Defaults to "flash".
@@ -112,6 +115,8 @@ class FlashTransformer(nn.Module):
                     attn_type=attn_type,
                     layer_idx=(i * 2),
                     cross_attn=True,
+                    cross_dim=cross_dim,
+                    softpick=softpick,
                 )
             else:
                 cross_attention = None
@@ -127,6 +132,7 @@ class FlashTransformer(nn.Module):
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else (i * 2) + 1,
                 sketcher_dim=sketcher_dim,
+                softpick=softpick,
                 **mha_kwargs,
             )
             # or use parallelBlock where attn & MLP are done in parallel

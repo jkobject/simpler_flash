@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Any, Optional, Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -14,12 +14,19 @@ try:
         flash_attn_kvpacked_func,
         flash_attn_qkvpacked_func,
     )
+    from .flashpickattention import (
+        flash_pick_attn_qkvpacked_func,
+        flash_pick_attn_kvpacked_func,
+    )
+
 except ModuleNotFoundError as e:
     print(e)
     print("FlashAttention is not installed, not using it..")
     # raise ValueError("FlashAttention is not installed, not using it..") from e
     flash_attn_kvpacked_func = None
     flash_attn_qkvpacked_func = None
+    flash_pick_attn_qkvpacked_func = None
+    flash_pick_attn_kvpacked_func = None
 
 # from .flashattention_triton import attention as triton_attention
 
@@ -90,6 +97,7 @@ class FlashSelfAttention(nn.Module):
         alibi_slopes: Any | None = None,
         deterministic: bool = False,
         use_triton: bool = True,
+        softpick: bool = False,
     ):
         """Implement the scaled dot product attention with softmax.
 
@@ -100,14 +108,17 @@ class FlashSelfAttention(nn.Module):
             attention_dropout (float, optional): The dropout rate to apply to the attention
                 (default: 0.0)
             causal (bool, optional): Whether to use causal attention. Defaults to False.
+            softpick (bool, optional): Whether to use softpick. Defaults to True.
         """
         super().__init__()
         if flash_attn_qkvpacked_func is None:
             print("FlashAttention is not installed, using triton instead")
             use_triton = True
         self.use_triton = use_triton
+        self.attention_dropout = attention_dropout
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.softpick = softpick
 
     def forward(
         self,
@@ -145,13 +156,22 @@ class FlashSelfAttention(nn.Module):
             # if qkv.stride(-1) != 1:
             #    qkv = qkv.contiguous()
         else:
-            return flash_attn_qkvpacked_func(
-                qkv,
-                bias,
-                # self.drop.p if self.training else 0.0,
-                causal,
-                self.softmax_scale,
-            )
+            if self.softpick:
+                return flash_pick_attn_qkvpacked_func(
+                    qkv,
+                    bias,
+                    # self.drop.p if self.training else 0.0,
+                    causal,
+                    self.softmax_scale,
+                )
+            else:
+                return flash_attn_qkvpacked_func(
+                    qkv,
+                    bias,
+                    causal,
+                    self.softmax_scale,
+                    self.attention_dropout,
+                )
 
 
 class FlashCrossAttention(nn.Module):
@@ -163,6 +183,7 @@ class FlashCrossAttention(nn.Module):
         alibi_slopes=None,
         deterministic=False,
         use_triton: bool = True,
+        softpick: bool = False,
     ):
         """
         Implement the scaled dot product attention with softmax.
@@ -183,6 +204,8 @@ class FlashCrossAttention(nn.Module):
         self.register_buffer("alibi_slopes", alibi_slopes, persistent=False)
         self.deterministic = deterministic
         self.use_triton = use_triton
+        self.softpick = softpick
+        self.attention_dropout = attention_dropout
 
     def forward(
         self,
@@ -218,16 +241,26 @@ class FlashCrossAttention(nn.Module):
         if kv.shape[3] != q.shape[2]:  # MQA/GQA
             kv = repeat(kv, "... hkv d -> ... (hkv g) d", g=q.shape[2] // kv.shape[3])
 
-        return flash_attn_kvpacked_func(
-            q,
-            kv,
-            None,
-            # self.drop.p if self.training else 0.0,
-            causal,
-            self.softmax_scale,
-            # alibi_slopes=self.alibi_slopes,
-            # deterministic=self.deterministic,
-        )
+        if self.softpick:
+            return flash_pick_attn_kvpacked_func(
+                q,
+                kv,
+                None,
+                # self.drop.p if self.training else 0.0,
+                causal,
+                self.softmax_scale,
+                # alibi_slopes=self.alibi_slopes,
+                # deterministic=self.deterministic,
+            )
+        else:
+            return flash_attn_kvpacked_func(
+                q,
+                kv,
+                None,
+                causal,
+                self.softmax_scale,
+                self.attention_dropout,
+            )
 
 
 class SelfAttention(nn.Module):
@@ -240,14 +273,22 @@ class SelfAttention(nn.Module):
             runtime)
         attention_dropout: The dropout rate to apply to the attention
             (default: 0.0)
+        softpick: Whether to use softpick. Defaults to True.
     """
 
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+    def __init__(
+        self,
+        causal=False,
+        softmax_scale=None,
+        attention_dropout=0.0,
+        softpick: bool = False,
+    ):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
         self.dropout = attention_dropout
+        self.softpick = softpick
 
     def forward(self, qkv, causal=None, key_padding_mask=None, bias=None):
         """
@@ -259,39 +300,48 @@ class SelfAttention(nn.Module):
             key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
                 False means to mask out. (B, S)
         """
-        # batch_size, seqlen = qkv.shape[0], qkv.shape[1]
+
         causal = self.causal if causal is None else causal
         q, k, v = qkv.unbind(dim=2)
-        output = nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=key_padding_mask,
-            dropout_p=self.dropout,
-            is_causal=causal,
-        )
+        if not self.softpick:
+            output = nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=key_padding_mask,
+                dropout_p=self.dropout,
+                is_causal=causal,
+            )
+        else:
+            softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+            batch_size, seqlen = qkv.shape[0], qkv.shape[1]
+            scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+            if key_padding_mask is not None:
+                padding_mask = torch.full(
+                    (batch_size, seqlen),
+                    -10000.0,
+                    dtype=scores.dtype,
+                    device=scores.device,
+                )
+                padding_mask.masked_fill_(key_padding_mask, 0.0)
+                # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+                scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+            if causal:
+                # "triu_tril_cuda_template" not implemented for 'BFloat16'
+                # So we have to construct the mask in float
+                causal_mask = torch.triu(
+                    torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
+                )
+                # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
+                scores = scores + causal_mask.to(dtype=scores.dtype)
+            attention = (
+                torch.softmax(scores, dim=-1, dtype=v.dtype)
+                if not self.softpick
+                else softpick(scores, dim=-1)
+            )
+            attention_drop = self.drop(attention)
+            output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
         return output
-        # softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
-        # scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-        # if key_padding_mask is not None:
-        #    padding_mask = torch.full(
-        #        (batch_size, seqlen), -10000.0, dtype=scores.dtype, device=scores.device
-        #    )
-        #    padding_mask.masked_fill_(key_padding_mask, 0.0)
-        #    # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-        #    scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
-        # if causal:
-        #    # "triu_tril_cuda_template" not implemented for 'BFloat16'
-        #    # So we have to construct the mask in float
-        #    causal_mask = torch.triu(
-        #        torch.full((seqlen, seqlen), -10000.0, device=scores.device), 1
-        #    )
-        #    # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-        #    scores = scores + causal_mask.to(dtype=scores.dtype)
-        # attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
-        # attention_drop = self.drop(attention)
-        # output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
-        # return output
 
 
 class CrossAttention(nn.Module):
@@ -350,7 +400,11 @@ class CrossAttention(nn.Module):
             )
             causal_mask = col_idx > row_idx + sk - seqlen_q
             scores = scores.masked_fill(causal_mask, -10000.0)
-        attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
+        attention = (
+            torch.softmax(scores, dim=-1, dtype=v.dtype)
+            if not self.softpick
+            else softpick(scores, dim=-1)
+        )
         attention_drop = self.drop(attention)
         output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
         return output
@@ -392,6 +446,19 @@ def _update_kv_cache(kv, inference_params, layer_idx):
     return kv_cache[batch_start:batch_end, :sequence_end, ...]
 
 
+def softpick(x, dim=-1, eps=1e-6):
+    # softpick function: relu(exp(x)-1) / sum(abs(exp(x)-1))
+    # numerically stable version
+    x_m = torch.max(x, dim=dim, keepdim=True).values
+    x_m_e_m = torch.exp(-x_m)
+    x_e_1 = torch.exp(x - x_m) - x_m_e_m
+    r_x_e_1 = nn.functional.relu(x_e_1)
+    a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
+    return r_x_e_1 / (
+        torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps
+    )  # epsilon is only useful if all inputs are EXACTLY 0. we might not even need it
+
+
 class MHA(nn.Module):
     def __init__(
         self,
@@ -420,6 +487,8 @@ class MHA(nn.Module):
         num_lsh_projections: int = 8,
         block_size: int = 128,
         sketcher_dim: int = 128,
+        cross_dim: int = 128,
+        softpick: bool = False,
     ) -> None:
         """
         MHA Multi-head self-attention and cross-attention
@@ -439,6 +508,7 @@ class MHA(nn.Module):
             out_proj_bias (bool, optional): whether to use bias in the output projection. Defaults to True.
             dropout (float, optional): dropout rate. Defaults to 0.0.
             softmax_scale (float, optional): The temperature to use for the softmax attention.
+            cross_dim (int, optional): dimension of the cross-attention element
             causal (bool, optional): whether to use causal attention. Defaults to False.
             layer_idx (int, optional): layer index for inference cache. Defaults to None.
             dwconv (bool, optional): whether to use depthwise convolution. Defaults to False.
@@ -458,11 +528,13 @@ class MHA(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.cross_attn = cross_attn
+        self.cross_dim = cross_dim
         self.causal = causal
         self.layer_idx = layer_idx
         self.dwconv = dwconv
         self.rotary_emb_dim = rotary_emb_dim
         self.attn_type = attn_type
+        self.softpick = softpick
         if self.attn_type == "flash" and (flash_attn_kvpacked_func is None):
             print(
                 "you requested flash transformer but it requires the flash package which is not installed"
@@ -509,9 +581,13 @@ class MHA(nn.Module):
         )
         wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
 
-        inner_attn_cls = SelfAttention
+        inner_attn_cls = partial(SelfAttention, softpick=self.softpick)
         if self.attn_type == "flash":
-            inner_attn_cls = partial(FlashSelfAttention, alibi_slopes=alibi_slopes)
+            inner_attn_cls = partial(
+                FlashSelfAttention,
+                alibi_slopes=alibi_slopes,
+                softpick=self.softpick,
+            )
         elif self.attn_type == "hyper":
             inner_attn_cls = partial(
                 HyperSelfAttention,
@@ -519,9 +595,13 @@ class MHA(nn.Module):
                 block_size=block_size,
                 lsh_num_projs=num_lsh_projections,
             )
-        inner_cross_attn_cls = CrossAttention
+        inner_cross_attn_cls = partial(CrossAttention, softpick=self.softpick)
         if self.attn_type == "flash":
-            inner_cross_attn_cls = partial(FlashCrossAttention, alibi_slopes=alibi_slopes)
+            inner_cross_attn_cls = partial(
+                FlashCrossAttention,
+                alibi_slopes=alibi_slopes,
+                softpick=self.softpick,
+            )
         elif self.attn_type == "hyper":
             inner_cross_attn_cls = partial(
                 HyperCrossAttention,
@@ -536,7 +616,7 @@ class MHA(nn.Module):
             self.Wq = linear_cls(
                 embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs
             )
-            self.Wkv = wqkv_cls(embed_dim, kv_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wkv = wqkv_cls(cross_dim, kv_dim, bias=qkv_proj_bias, **factory_kwargs)
         if self.dwconv:
             if self.num_heads_kv == self.num_heads:
                 self.dwconv_qkv = nn.Conv1d(

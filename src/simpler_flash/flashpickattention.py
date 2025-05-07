@@ -92,8 +92,6 @@ def _fwd_kernel(
     seqlen_k,
     seqlen_q_rounded,
     headdim,
-    dropout_p,
-    dropout_seed,
     CACHE_KEY_SEQLEN_Q,
     CACHE_KEY_SEQLEN_K,
     BIAS_TYPE: tl.constexpr,
@@ -136,8 +134,6 @@ def _fwd_kernel(
         seqlen_k (int): Sequence length for the key tensor
         seqlen_q_rounded (int): Rounded up sequence length for the query tensor
         headdim (int): Dimension of each attention head
-        dropout_p (float): Dropout probability for attention weights. Default is 0.0 (no dropout).
-        dropout_seed (int): Seed for dropout random number generation.
         CACHE_KEY_SEQLEN_Q (int): Cached sequence length for the query tensor
         CACHE_KEY_SEQLEN_K (int): Cached sequence length for the key tensor
         BIAS_TYPE (tl.constexpr): Type of bias used. Can be 'none', 'vector', or 'matrix'
@@ -193,13 +189,15 @@ def _fwd_kernel(
         )
     # initialize pointer to m and l
     t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
-    lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    # For softpick:
+    # max_i stores the running maximum of scores.
+    # sum_abs_val_i stores the running sum of absolute differences for normalization.
+    max_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    sum_abs_val_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+
     # load q: it will stay in SRAM throughout
-    # [2022-10-30] TD: Triton bug - in the case of EVEN_M=True and EVEN_N=False, if we just call
-    # tl.load(q_ptrs), we get the wrong output!
-    if EVEN_M & EVEN_N:
+    if EVEN_M & EVEN_N:  # Bug fix for Triton compiler as in original
         if EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
@@ -213,14 +211,13 @@ def _fwd_kernel(
                 mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                 other=0.0,
             )
+
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- compute qk ----
-        if (
-            EVEN_N & EVEN_M
-        ):  # If we just do "if EVEN_N", there seems to be some race condition
+        # -- load k, v --
+        if EVEN_N & EVEN_M:
             if EVEN_HEADDIM:
                 k = tl.load(k_ptrs + start_n * stride_kn)
             else:
@@ -243,15 +240,19 @@ def _fwd_kernel(
                     & (offs_d[None, :] < headdim),
                     other=0.0,
                 )
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, tl.trans(k))
-        # Trying to combine the two masks seem to make the result wrong
-        if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
-            qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
-        if IS_CAUSAL:
-            qk += tl.where(
+
+        # -- compute qk_orig ---
+        qk_orig = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk_orig += tl.dot(q, tl.trans(k))
+
+        if not EVEN_N:  # Mask out padding tokens
+            qk_orig += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
+        if IS_CAUSAL:  # Mask out future tokens
+            qk_orig += tl.where(
                 offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf")
             )
+
+        # -- compute scores_eff ---
         if BIAS_TYPE != "none":
             if BIAS_TYPE == "vector":
                 if EVEN_N:
@@ -271,60 +272,50 @@ def _fwd_kernel(
                         & ((start_n + offs_n)[None, :] < seqlen_k),
                         other=0.0,
                     ).to(tl.float32)
-            # Slightly faster to multiply the softmax_scale in the tl.exp below since the compiler
-            # can then fuse the mult and add into an fma instruction. But if we have bias we need to
-            # to multiply with softmax_scale here.
-            qk = qk * softmax_scale + bias
-            m_ij = tl.maximum(tl.max(qk, 1), lse_i)
-            p = tl.exp(qk - m_ij[:, None])
+            scores_eff = qk_orig * softmax_scale + bias
         else:
-            m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
-            p = tl.exp(qk * softmax_scale - m_ij[:, None])
-        l_ij = tl.sum(p, 1)
+            scores_eff = qk_orig * softmax_scale
 
-        # Apply dropout if dropout_p > 0
-        if dropout_p > 0.0:
-            # Create global 2D offsets for the random number generator to ensure unique random numbers
-            # for each element of the attention probability matrix p in the current block.
-            m_arange = tl.arange(0, BLOCK_M)
-            n_arange = tl.arange(0, BLOCK_N)
+        # -- softpick computation --
+        m_ij = tl.maximum(tl.max(scores_eff, 1), max_i)
 
-            # Absolute indices in Q and K sequences for the current block
-            abs_m_indices = start_m * BLOCK_M + m_arange
-            abs_n_indices = start_n + n_arange
+        exp_scores_minus_mij = tl.exp(scores_eff - m_ij[:, None])
+        exp_neg_mij = tl.exp(
+            -m_ij[:, None]
+        )  # This is exp(-max_effective_score_for_block)
+        # Note: og_flashsoftpick used exp(-b_m) where b_m was new max.
+        # Here m_ij is the new max.
+        exp_diff_terms = exp_scores_minus_mij - exp_neg_mij
 
-            # Offsets for tl.rand, shape (BLOCK_M, BLOCK_N)
-            # Multiply by seqlen_k to make offsets unique across rows, then add unique column offset.
-            # Ensure results fit in int32 if possible; tl.rand expects int32 offsets.
-            # seqlen_k can be large, but product should fit int32 for typical transformer sizes.
-            rand_offsets = (
-                abs_m_indices[:, None] * seqlen_k + abs_n_indices[None, :]
-            ).to(tl.int32)
+        p_num_block = tl.maximum(exp_diff_terms, 0.0)
+        # Denominator terms: sum_k abs(exp(s_k - m_ij) - exp(-m_ij))
+        # Masking for p_den_terms_abs is implicitly handled by scores_eff being -inf for masked elements,
+        # which makes exp_scores_minus_mij zero. Then exp_diff_terms is -exp_neg_mij.
+        # abs makes it exp_neg_mij. sum will include these.
+        # This is consistent with softpick definition.
+        p_den_terms_abs = tl.abs(exp_diff_terms)
+        # Explicitly zero out contributions from masked tokens to sum_abs_val_block
+        # if not EVEN_N: # Not needed if scores_eff is -inf
+        #    p_den_terms_abs = tl.where((start_n + offs_n)[None, :] < seqlen_k, p_den_terms_abs, 0.0)
+        # if IS_CAUSAL: # Not needed if scores_eff is -inf
+        #    p_den_terms_abs = tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], p_den_terms_abs, 0.0)
 
-            # Generate random numbers. dropout_seed is an int passed to the kernel.
-            random_numbers = tl.rand(dropout_seed.to(tl.int32), rand_offsets)
+        sum_abs_val_block = tl.sum(p_den_terms_abs, 1)
 
-            dropout_mask = random_numbers > dropout_p
-            # Scale by 1 / (1 - p)
-            # Ensure dropout_p < 1.0 to avoid division by zero.
-            # This scaling factor will be computed at runtime as dropout_p is not constexpr.
-            p = tl.where(dropout_mask, p / (1.0 - dropout_p), 0.0)
-
-            # Recompute l_ij with the new p after dropout
-            l_ij = tl.sum(p, 1)
-
-        # scale acc_o
-        acc_o_scale = tl.exp(m_i - m_ij)
-
-        # # -- update output accumulator --
+        # Rescale previous accumulators
         # BUG: have to store and immediately load
-        tl.store(t_ptrs, acc_o_scale)
-        acc_o_scale = tl.load(t_ptrs)
-        acc_o = acc_o * acc_o_scale[:, None]
-        # update acc_o
-        if (
-            EVEN_N & EVEN_M
-        ):  # If we just do "if EVEN_N", there seems to be some race condition
+        exp_max_diff_scale = tl.exp(max_i - m_ij)
+        tl.store(t_ptrs, exp_max_diff_scale)
+        exp_max_diff_scale = tl.load(t_ptrs)
+
+        acc_o = acc_o * exp_max_diff_scale[:, None]
+        sum_abs_val_i = sum_abs_val_i * exp_max_diff_scale
+
+        # Update accumulators with current block
+        sum_abs_val_i += sum_abs_val_block
+
+        # Load V
+        if EVEN_N & EVEN_M:
             if EVEN_HEADDIM:
                 v = tl.load(v_ptrs + start_n * stride_vn)
             else:
@@ -347,45 +338,50 @@ def _fwd_kernel(
                     & (offs_d[None, :] < headdim),
                     other=0.0,
                 )
-        p = p.to(v.dtype)
-        acc_o += tl.dot(p, v)
+        acc_o += tl.dot(p_num_block.to(v.dtype), v)
 
-        # -- update statistics
-        m_i = m_ij
-        l_i_new = tl.exp(lse_i - m_ij) + l_ij
-        lse_i = m_ij + tl.log(l_i_new)
+        # Update current max
+        max_i = m_ij
 
-    o_scale = tl.exp(m_i - lse_i)
-    # BUG: have to store and immediately load
-    tl.store(t_ptrs, o_scale)
-    o_scale = tl.load(t_ptrs)
-    acc_o = acc_o * o_scale[:, None]
-    # rematerialize offsets to save registers
-    start_m = tl.program_id(0)
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    # write back l and m
+    # Finalize output and LSE
+    sum_abs_val_final_safe = sum_abs_val_i + 1e-6  # Add epsilon for stability
+
+    # Store LSE: max_i + log(sum_abs_val_final_safe)
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
-    tl.store(lse_ptrs, lse_i)
-    # initialize pointers to output
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    tl.store(lse_ptrs, max_i + tl.log(sum_abs_val_final_safe))
+
+    # Store Output: acc_o / sum_abs_val_final_safe
+    # BUG: have to store and immediately load o_scale if it were exp. Here it's division.
+    # final_out_scale = 1.0 / sum_abs_val_final_safe # Replaced direct division
+    # tl.store(t_ptrs, final_out_scale)
+    # final_out_scale = tl.load(t_ptrs)
+    # acc_o_final = acc_o * final_out_scale[:, None]
+    acc_o_final = acc_o / sum_abs_val_final_safe[:, None]
+
+    # rematerialize offsets to save registers (not needed, already have them)
+    # offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(
+        0, BLOCK_HEADDIM
+    )  # Re-declare for clarity if registers were an issue
     out_ptrs = (
         Out
         + off_b * stride_ob
         + off_h * stride_oh
         + (offs_m[:, None] * stride_om + offs_d[None, :])
     )
+
     if EVEN_M:
         if EVEN_HEADDIM:
-            tl.store(out_ptrs, acc_o)
+            tl.store(out_ptrs, acc_o_final)
         else:
-            tl.store(out_ptrs, acc_o, mask=offs_d[None, :] < headdim)
+            tl.store(out_ptrs, acc_o_final, mask=offs_d[None, :] < headdim)
     else:
         if EVEN_HEADDIM:
-            tl.store(out_ptrs, acc_o, mask=offs_m[:, None] < seqlen_q)
+            tl.store(out_ptrs, acc_o_final, mask=offs_m[:, None] < seqlen_q)
         else:
             tl.store(
                 out_ptrs,
-                acc_o,
+                acc_o_final,
                 mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
             )
 
@@ -533,8 +529,6 @@ def _bwd_kernel_one_col_block(
     EVEN_HEADDIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    dropout_p,
-    dropout_seed,
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
     begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
@@ -608,7 +602,6 @@ def _bwd_kernel_one_col_block(
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m_curr = start_m + offs_m
         # load q, k, v, do on-chip
-        # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
         if EVEN_M & EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
@@ -620,15 +613,19 @@ def _bwd_kernel_one_col_block(
                     mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                     other=0.0,
                 )
-        # recompute p = softmax(qk, dim=-1).T
-        qk = tl.dot(q, tl.trans(k))
-        # Trying to combine the two masks seem to make the result wrong
-        if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
-            qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
+
+        # recompute scores_eff = qk_orig * softmax_scale (+ bias)
+        qk_orig = tl.dot(q, tl.trans(k))
+        # Apply masks consistent with forward
+        if not EVEN_N:
+            qk_orig = tl.where(offs_n[None, :] < seqlen_k, qk_orig, float("-inf"))
         if IS_CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+            qk_orig = tl.where(
+                offs_m_curr[:, None] >= (offs_n[None, :]), qk_orig, float("-inf")
+            )
+
         if BIAS_TYPE != "none":
-            tl.debug_barrier()  # Race condition otherwise
+            tl.debug_barrier()
             if BIAS_TYPE == "vector":
                 if EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
@@ -647,127 +644,120 @@ def _bwd_kernel_one_col_block(
                         & (offs_n[None, :] < seqlen_k),
                         other=0.0,
                     ).to(tl.float32)
-            qk = qk * softmax_scale + bias
-        # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
-        # Also wrong for headdim=64.
-        if not (EVEN_M & EVEN_HEADDIM):
-            tl.debug_barrier()
-        lse_i = tl.load(LSE + offs_m_curr)
-        if BIAS_TYPE == "none":
-            p = tl.exp(qk * softmax_scale - lse_i[:, None])
+            scores_eff = qk_orig * softmax_scale + bias
         else:
-            p = tl.exp(qk - lse_i[:, None])
+            scores_eff = qk_orig * softmax_scale
 
-        # Apply dropout if dropout_p > 0, recomputing the same mask as in fwd
-        if dropout_p > 0.0:
-            # offs_m_curr are absolute q indices: start_m_loop + tl.arange(0, BLOCK_M)
-            # offs_n are absolute k indices: start_n_col_arg * BLOCK_N + tl.arange(0, BLOCK_N)
-            # seqlen_k is the total sequence length of K.
-            # These are the same as abs_m_indices and abs_n_indices in the forward pass
-            # for the current (q_block, k_block)
-            rand_offsets_bwd = (offs_m_curr[:, None] * seqlen_k + offs_n[None, :]).to(
-                tl.int32
-            )
-            random_numbers_bwd = tl.rand(dropout_seed.to(tl.int32), rand_offsets_bwd)
-            dropout_mask_bwd = random_numbers_bwd > dropout_p
-            p = tl.where(dropout_mask_bwd, p / (1.0 - dropout_p), 0.0)
+        if not (EVEN_M & EVEN_HEADDIM):  # Barrier from original code
+            tl.debug_barrier()
 
-        # compute dv
-        # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
-        # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
-        # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
-        # the output is correct.
+        lse_i = tl.load(LSE + offs_m_curr)  # This is max_final + log(sum_abs_final)
+        Di = tl.load(D + offs_m_curr)  # This is sum(o * do)
+
+        # Load dO
         if EVEN_M & EVEN_HEADDIM:
             do = tl.load(do_ptrs)
         else:
-            # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
             do = tl.load(
                 do_ptrs,
                 mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                 other=0.0,
             )
-        # if EVEN_M:
-        #     if EVEN_HEADDIM:
-        #         do = tl.load(do_ptrs)
-        #     else:
-        #         do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
-        # else:
-        #     if EVEN_HEADDIM:
-        #         do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
-        #     else:
-        #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
-        #                                    & (offs_d[None, :] < headdim), other=0.0)
-        dv += tl.dot(tl.trans(p.to(do.dtype)), do)
-        # compute dp = dot(v, do)
-        # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
-        # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
-        # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
+
+        # --- Softpick backward pass ---
+        # 1. Compute P_softpick_terms for dV
+        # X_over_D_terms = exp(scores_eff - lse_i[:,None]) - exp(-lse_i[:,None]) -> this is (exp(s-m)-exp(-m))/D
+        # lse_i contains m, so exp(-lse_i) is exp(-(m+logD)) = exp(-m)/D
+        # exp(scores_eff - lse_i[:,None]) is exp(s-(m+logD)) = exp(s-m)/D
+        X_over_D_terms = tl.exp(scores_eff - lse_i[:, None]) - tl.exp(-lse_i[:, None])
+        P_softpick_terms = tl.maximum(X_over_D_terms, 0.0)
+
+        # Mask P_softpick_terms consistent with forward pass logic for scores_eff
+        # (already handled if scores_eff is -inf for masked parts, making X_over_D_terms negative or zero pre-relu)
+        # Example explicit masking (if needed, though scores_eff should handle it):
+        # if not EVEN_N:
+        #    P_softpick_terms = tl.where(offs_n[None, :] < seqlen_k, P_softpick_terms, 0.0)
+        # if IS_CAUSAL:
+        #    P_softpick_terms = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), P_softpick_terms, 0.0)
+
+        dv += tl.dot(tl.trans(P_softpick_terms.to(do.dtype)), do)
+
+        # 2. Compute ds (dL/d(qk_orig)) for dQ, dK
+        # dp = dot(v, do) or dot(do, v.T)
+        # Barrier from original
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, tl.trans(v))
-        # There's a race condition for headdim=48
-        if not EVEN_HEADDIM:
+        if not EVEN_HEADDIM:  # Barrier from original
             tl.debug_barrier()
-        # compute ds = p * (dp - delta[:, None])
-        # Putting the subtraction after the dp matmul (instead of before) is slightly faster
-        Di = tl.load(D + offs_m_curr)
-        # Converting ds to q.dtype here reduces register pressure and makes it much faster
-        # for BLOCK_HEADDIM=128
-        ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+
+        # p_scaled_exp_div_sum_abs = exp(scores_eff - lse_i[:,None]) -> exp(s-m)/D
+        p_scaled_exp_div_sum_abs = tl.exp(scores_eff - lse_i[:, None])
+
+        # Conditions based on scores_eff > 0 (as in og_flashsoftpick)
+        ds_intermediate_term = tl.where(scores_eff > 0, dp, 0.0)
+        ds_delta_term = tl.where(scores_eff > 0, Di[:, None], -Di[:, None])
+
+        ds_wrt_scores_eff = p_scaled_exp_div_sum_abs * (
+            ds_intermediate_term - ds_delta_term
+        )
+        # ds is dL/d(qk_orig), so multiply by softmax_scale
+        ds = (ds_wrt_scores_eff * softmax_scale).to(q.dtype)
+
         # compute dk = dot(ds.T, q)
-        dk += tl.dot(tl.trans(ds), q)
+        dk += tl.dot(tl.trans(ds), q)  # q is unscaled here.
+
         # compute dq
-        if not (
-            EVEN_M & EVEN_HEADDIM
-        ):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
+        if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         if not ATOMIC_ADD:
-            if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
-                dq = tl.load(dq_ptrs, eviction_policy="evict_last")
-                dq += tl.dot(ds, k)
-                tl.store(dq_ptrs, dq, eviction_policy="evict_last")
+            if EVEN_M & EVEN_HEADDIM:
+                dq_old = tl.load(dq_ptrs, eviction_policy="evict_last")
+                dq_old += tl.dot(ds, k)  # k is unscaled here.
+                tl.store(dq_ptrs, dq_old, eviction_policy="evict_last")
             else:
+                # (Masked load, add, store for dq)
                 if EVEN_HEADDIM:
-                    dq = tl.load(
+                    dq_old = tl.load(
                         dq_ptrs,
                         mask=offs_m_curr[:, None] < seqlen_q,
                         other=0.0,
                         eviction_policy="evict_last",
                     )
-                    dq += tl.dot(ds, k)
+                    dq_old += tl.dot(ds, k)
                     tl.store(
                         dq_ptrs,
-                        dq,
+                        dq_old,
                         mask=offs_m_curr[:, None] < seqlen_q,
                         eviction_policy="evict_last",
                     )
                 else:
-                    dq = tl.load(
+                    dq_old = tl.load(
                         dq_ptrs,
                         mask=(offs_m_curr[:, None] < seqlen_q)
                         & (offs_d[None, :] < headdim),
                         other=0.0,
                         eviction_policy="evict_last",
                     )
-                    dq += tl.dot(ds, k)
+                    dq_old += tl.dot(ds, k)
                     tl.store(
                         dq_ptrs,
-                        dq,
+                        dq_old,
                         mask=(offs_m_curr[:, None] < seqlen_q)
                         & (offs_d[None, :] < headdim),
                         eviction_policy="evict_last",
                     )
-        else:  # If we're parallelizing across the seqlen_k dimension
-            dq = tl.dot(ds, k)
-            if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
-                tl.atomic_add(dq_ptrs, dq)
+        else:  # SEQUENCE_PARALLEL, use atomic add for dq
+            dq_new = tl.dot(ds, k)
+            if EVEN_M & EVEN_HEADDIM:
+                tl.atomic_add(dq_ptrs, dq_new)
             else:
                 if EVEN_HEADDIM:
-                    tl.atomic_add(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q)
+                    tl.atomic_add(dq_ptrs, dq_new, mask=offs_m_curr[:, None] < seqlen_q)
                 else:
                     tl.atomic_add(
                         dq_ptrs,
-                        dq,
+                        dq_new,
                         mask=(offs_m_curr[:, None] < seqlen_q)
                         & (offs_d[None, :] < headdim),
                     )
@@ -882,8 +872,6 @@ def _bwd_kernel(
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
-    dropout_p,
-    dropout_seed,
     SEQUENCE_PARALLEL: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
@@ -943,8 +931,6 @@ def _bwd_kernel(
                 EVEN_HEADDIM=EVEN_HEADDIM,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
-                dropout_p=dropout_p,
-                dropout_seed=dropout_seed,
             )
     else:
         start_n = tl.program_id(0)
@@ -981,8 +967,6 @@ def _bwd_kernel(
             EVEN_HEADDIM=EVEN_HEADDIM,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            dropout_p=dropout_p,
-            dropout_seed=dropout_seed,
         )
 
 
@@ -993,7 +977,6 @@ def _flash_attn_forward(
     bias: torch.Tensor | None = None,
     causal: bool = False,
     softmax_scale: float | None = None,
-    dropout_p: float = 0.0,
 ) -> torch.Tensor:
     """
     Perform the forward pass of FlashAttention.
@@ -1005,13 +988,10 @@ def _flash_attn_forward(
         bias (Optional[torch.Tensor]): Bias tensor of shape (batch, nheads, seqlen_q, seqlen_k) or (batch, nheads, 1, seqlen_k). Default is None.
         causal (bool): Whether to apply causal masking. Default is False.
         softmax_scale (Optional[float]): Scaling factor for the softmax operation. Default is None.
-        dropout_p (float): Dropout probability for attention weights. Default is 0.0 (no dropout).
-                           If > 0, applies dropout to attention weights.
-                           Note: The backward pass currently does not support dropout gradients.
 
     Returns
     -------
-        Tuple[torch.Tensor, torch.Tensor, float]: Output tensor, LSE tensor, and softmax_scale.
+        torch.Tensor: Output tensor of the same shape as the query tensor.
     """
     # shape constraints
     batch, seqlen_q, _, d = q.shape
@@ -1023,18 +1003,6 @@ def _flash_attn_forward(
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
-
-    dropout_seed = 0
-    if dropout_p > 0.0:
-        if not (0.0 < dropout_p < 1.0):
-            raise ValueError(
-                f"dropout_p must be between 0.0 and 1.0 (exclusive of 1.0), got {dropout_p}"
-            )
-        # Generate a random seed for dropout. Triton's tl.rand expects an int seed.
-        # Using torch.int32 to align with common practices for PRNG seeds in such contexts.
-        dropout_seed = torch.randint(
-            0, 2**31 - 1, (1,), dtype=torch.int32, device=q.device
-        ).item()
 
     has_bias = bias is not None
     bias_type = "none"
@@ -1097,8 +1065,6 @@ def _flash_attn_forward(
         seqlen_k,
         seqlen_q_rounded,
         d,
-        dropout_p,
-        dropout_seed,
         seqlen_q // 32,
         seqlen_k // 32,  # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
@@ -1111,24 +1077,11 @@ def _flash_attn_forward(
         num_warps=num_warps,
         num_stages=1,
     )
-    return o, lse, softmax_scale, dropout_seed
+    return o, lse, softmax_scale  # softmax_scale could have been updated
 
 
 def _flash_attn_backward(
-    do,
-    q,
-    k,
-    v,
-    o,
-    lse,
-    dq,
-    dk,
-    dv,
-    bias=None,
-    causal=False,
-    softmax_scale=None,
-    dropout_p: float = 0.0,
-    dropout_seed: int = 0,
+    do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, softmax_scale=None
 ):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
@@ -1240,8 +1193,10 @@ def _flash_attn_backward(
         bias_type,
         causal,
         BLOCK_HEADDIM,
-        dropout_p,
-        dropout_seed,
+        # SEQUENCE_PARALLEL=False,
+        # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        # num_warps=num_warps,
+        # num_stages=1,
     )
     dq.copy_(dq_accum)
 
@@ -1254,7 +1209,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         bias: torch.Tensor | None = None,
         causal: bool = False,
         softmax_scale: float | None = None,
-        dropout_p: float = 0.0,
     ) -> torch.Tensor:
         """
         Forward pass for FlashAttention.
@@ -1267,7 +1221,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
                 ALiBi mask for non-causal would have shape (1, nheads, seqlen, seqlen).
             causal (bool): Whether to apply causal masking. Default is False.
             softmax_scale (Optional[float]): Optional scaling factor for softmax. Default is None.
-            dropout_p (float): Dropout probability for attention weights. Default is 0.0 (no dropout).
 
         Returns
         -------
@@ -1276,27 +1229,21 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         # Make sure that the last dimension is contiguous
         if qkv.stride(-1) != 1:
             qkv = qkv.contiguous()
-        o, lse, ctx.softmax_scale, dropout_seed = _flash_attn_forward(
+        o, lse, ctx.softmax_scale = _flash_attn_forward(
             qkv[:, :, 0],
             qkv[:, :, 1],
             qkv[:, :, 2],
             bias=bias,
             causal=causal,
             softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
         )
         ctx.save_for_backward(qkv, o, lse, bias)
         ctx.causal = causal
-        ctx.dropout_p = dropout_p
-        ctx.dropout_seed = dropout_seed
         return o
 
     @staticmethod
     def backward(ctx, do):
         qkv, o, lse, bias = ctx.saved_tensors
-        # Retrieve dropout_p and dropout_seed
-        dropout_p = ctx.dropout_p
-        dropout_seed = ctx.dropout_seed
         assert not ctx.needs_input_grad[
             1
         ], "FlashAttention does not support bias gradient yet"
@@ -1317,13 +1264,11 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
                 bias=bias,
                 causal=ctx.causal,
                 softmax_scale=ctx.softmax_scale,
-                dropout_p=dropout_p,
-                dropout_seed=dropout_seed,
             )
-        return dqkv, None, None, None, None
+        return dqkv, None, None, None
 
 
-flash_attn_qkvpacked_func = FlashAttnQKVPackedFunc.apply
+flash_pick_attn_qkvpacked_func = FlashAttnQKVPackedFunc.apply
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
@@ -1335,7 +1280,6 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         bias: torch.Tensor | None = None,
         causal: bool = False,
         softmax_scale: float | None = None,
-        dropout_p: float = 0.0,
     ) -> torch.Tensor:
         """
         Perform the forward pass of FlashAttention with packed key and value tensors.
@@ -1348,7 +1292,6 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
                 ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k).
             causal (bool): Whether to apply causal masking. Default is False.
             softmax_scale (Optional[float]): Scaling factor for the softmax operation. Default is None.
-            dropout_p (float): Dropout probability for attention weights. Default is 0.0 (no dropout).
 
         Returns
         -------
@@ -1356,27 +1299,21 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         """
         # Make sure that the last dimension is contiguous
         q, kv = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, kv]]
-        o, lse, ctx.softmax_scale, dropout_seed = _flash_attn_forward(
+        o, lse, ctx.softmax_scale = _flash_attn_forward(
             q,
             kv[:, :, 0],
             kv[:, :, 1],
             bias=bias,
             causal=causal,
             softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
         )
         ctx.save_for_backward(q, kv, o, lse, bias)
         ctx.causal = causal
-        ctx.dropout_p = dropout_p
-        ctx.dropout_seed = dropout_seed
         return o
 
     @staticmethod
     def backward(ctx, do):
         q, kv, o, lse, bias = ctx.saved_tensors
-        # Retrieve dropout_p and dropout_seed
-        dropout_p = ctx.dropout_p
-        dropout_seed = ctx.dropout_seed
         if len(ctx.needs_input_grad) >= 3:
             assert not ctx.needs_input_grad[
                 2
@@ -1399,94 +1336,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
                 bias=bias,
                 causal=ctx.causal,
                 softmax_scale=ctx.softmax_scale,
-                dropout_p=dropout_p,
-                dropout_seed=dropout_seed,
             )
-        return dq, dkv, None, None, None, None
+        return dq, dkv, None, None, None
 
 
-flash_attn_kvpacked_func = FlashAttnKVPackedFunc.apply
-
-
-class FlashAttnFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: torch.autograd.Function,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        bias: torch.Tensor | None = None,
-        causal: bool = False,
-        softmax_scale: float | None = None,
-        dropout_p: float = 0.0,
-    ) -> torch.Tensor:
-        """
-        Perform the forward pass of FlashAttention.
-
-        Args:
-            q (torch.Tensor): Query tensor of shape (batch_size, seqlen_q, nheads, headdim).
-            k (torch.Tensor): Key tensor of shape (batch_size, seqlen_k, nheads, headdim).
-            v (torch.Tensor): Value tensor of shape (batch_size, seqlen_k, nheads, headdim).
-            bias (Optional[torch.Tensor]): Bias tensor, shape broadcastible to (batch, nheads, seqlen_q, seqlen_k).
-                For example, ALiBi mask for causal would have shape (1, nheads, 1, seqlen_k).
-                ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k).
-            causal (bool): Whether to apply causal masking. Default is False.
-            softmax_scale (Optional[float]): Scaling factor for the softmax operation. Default is None.
-            dropout_p (float): Dropout probability for attention weights. Default is 0.0 (no dropout).
-
-        Returns
-        -------
-            torch.Tensor: Output tensor after applying FlashAttention.
-        """
-        # Make sure that the last dimension is contiguous
-        q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
-        o, lse, ctx.softmax_scale, dropout_seed = _flash_attn_forward(
-            q,
-            k,
-            v,
-            bias=bias,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-        )
-        ctx.save_for_backward(q, k, v, o, lse, bias)
-        ctx.causal = causal
-        ctx.dropout_p = dropout_p
-        ctx.dropout_seed = dropout_seed
-        return o, lse
-
-    @staticmethod
-    def backward(ctx, do, dlse_use_needed=None):
-        q, k, v, o, lse, bias = ctx.saved_tensors
-        # Retrieve dropout_p and dropout_seed
-        dropout_p = ctx.dropout_p
-        dropout_seed = ctx.dropout_seed
-        assert not ctx.needs_input_grad[
-            3
-        ], "FlashAttention does not support bias gradient yet"
-        # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
-        # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
-        with torch.inference_mode():
-            dq = torch.empty_like(q)
-            dk = torch.empty_like(k)
-            dv = torch.empty_like(v)
-            _flash_attn_backward(
-                do,
-                q,
-                k,
-                v,
-                o,
-                lse,
-                dq,
-                dk,
-                dv,
-                bias=bias,
-                causal=ctx.causal,
-                softmax_scale=ctx.softmax_scale,
-                dropout_p=dropout_p,
-                dropout_seed=dropout_seed,
-            )
-        return dq, dk, dv, None, None, None, None
-
-
-flash_attn_func = FlashAttnFunc.apply
+flash_pick_attn_kvpacked_func = FlashAttnKVPackedFunc.apply

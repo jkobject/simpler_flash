@@ -36,7 +36,7 @@ class Block(nn.Module):
         residual_in_fp32: bool = False,
         sequence_parallel: bool = False,
         mark_shared_params: bool = False,
-        cross_attn: str | None = None,
+        cross_attn: Callable | None = None,
         sketcher_dim: int = 128,
     ):
         """
