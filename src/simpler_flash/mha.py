@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
+
 from .hyper_attention import HyperAttention
 
 try:
@@ -15,8 +16,8 @@ try:
         flash_attn_qkvpacked_func,
     )
     from .flashpickattention import (
-        flash_pick_attn_qkvpacked_func,
         flash_pick_attn_kvpacked_func,
+        flash_pick_attn_qkvpacked_func,
     )
 
 except ModuleNotFoundError as e:
@@ -300,7 +301,6 @@ class SelfAttention(nn.Module):
             key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
                 False means to mask out. (B, S)
         """
-
         causal = self.causal if causal is None else causal
         q, k, v = qkv.unbind(dim=2)
         if not self.softpick:

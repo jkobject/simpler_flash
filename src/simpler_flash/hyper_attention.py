@@ -1,9 +1,8 @@
 import torch
 
-from .hyper.attn_utils import add_self_attentions
 from .flashattention import flash_attn_func
-from .hyper.hyper_attn_triton import hyper_attn_func
 from .hyper.angular_lsh_triton import AngularLSHTriton
+from .hyper.hyper_attn_triton import hyper_attn_func
 
 
 class HyperAttention(torch.nn.Module):

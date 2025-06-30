@@ -1,7 +1,6 @@
 import os
 import sys
 from collections.abc import Callable
-from typing import Optional
 from functools import partial
 
 import torch
@@ -12,7 +11,7 @@ from torchvision.ops import StochasticDepth
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
-from . import MHA, Block, Mlp, RMSNorm  # noqa: E402
+from . import MHA, Block, Mlp  # noqa: E402
 
 try:
     from .layer_norm import layer_norm_fn
@@ -177,11 +176,11 @@ class FlashTransformer(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        x_kv: Optional[Tensor] = None,
+        x_kv: Tensor | None = None,
         return_qkv=[],
-        bias: Optional[Tensor] = None,
+        bias: Tensor | None = None,
         bias_layer=[],
-        mask_zeros: Optional[Tensor] = None,
+        mask_zeros: Tensor | None = None,
     ) -> Tensor:
         residual = None
         qkvs = []

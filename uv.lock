@@ -1,5 +1,10 @@
 version = 1
-requires-python = "==3.10.*"
+requires-python = ">=3.10"
+resolution-markers = [
+    "python_full_version < '3.11'",
+    "python_full_version == '3.11.*'",
+    "python_full_version >= '3.12'",
+]
 
 [[package]]
 name = "accessible-pygments"
@@ -47,6 +52,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/fc/0f/aafca9af9315aee06a89ffde799a10a582fe8de76c563ee80bbcdc08b3fb/attrs-24.2.0.tar.gz", hash = "sha256:5cfb1b9148b5b086569baec03f20d7b6bf3bcacc9a42bebf87ffaaca362f6346", size = 792678 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6a/21/5b6702a7f963e95456c0de2d495f67bf5fd62840ac655dc451586d23d39a/attrs-24.2.0-py3-none-any.whl", hash = "sha256:81921eb96de3191c8258c199618104dd27ac608d9366f5e35d011eae1867ede2", size = 63001 },
+]
+
+[[package]]
+name = "axial-positional-embedding"
+version = "0.3.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/12/e6/294c09aa82ccfb8ea18276cbce61964f35758f5de28f2677acf4fd71fcce/axial_positional_embedding-0.3.12.tar.gz", hash = "sha256:10d98f342f8fa0d4d3d20b36ed27fb0fc63f1d398202b9165e07bc9d6130bc17", size = 6312 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/f9/25753b9de3029d3eb2487755520b98eb72b0cb562d8974329c6e19831063/axial_positional_embedding-0.3.12-py3-none-any.whl", hash = "sha256:f5708106b18903c3b99aced0bfa79d1ae6f708dae34f56e641e8c24dbc06b02f", size = 6726 },
 ]
 
 [[package]]
@@ -447,7 +465,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "decorator" },
-    { name = "exceptiongroup" },
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "jedi" },
     { name = "matplotlib-inline" },
     { name = "pexpect", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -455,7 +473,7 @@ dependencies = [
     { name = "pygments" },
     { name = "stack-data" },
     { name = "traitlets" },
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d8/8b/710af065ab8ed05649afa5bd1e07401637c9ec9fb7cfda9eac7e91e9fbd4/ipython-8.30.0.tar.gz", hash = "sha256:cb0a405a306d2995a5cbb9901894d240784a9f341394c6ba3f4fe8c6eb89ff6e", size = 5592205 }
 wheels = [
@@ -569,6 +587,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/98/e7/ed339caf3662976949e4fdbfdf4a6db818b8d2aa1cf2b5f73af89e936bba/latexcodec-3.0.0.tar.gz", hash = "sha256:917dc5fe242762cc19d963e6548b42d63a118028cdd3361d62397e3b638b6bc5", size = 31023 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b0/bf/ea8887e9f31a8f93ca306699d11909c6140151393a4216f0d9f85a004077/latexcodec-3.0.0-py3-none-any.whl", hash = "sha256:6f3477ad5e61a0a99bd31a6a370c34e88733a6bad9c921a3ffcfacada12f41a7", size = 18150 },
+]
+
+[[package]]
+name = "local-attention"
+version = "1.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/be/66/8e7ab34c3c56bf771417ad1a0890d9b867512962e673d8f582bef35884e3/local_attention-1.10.0.tar.gz", hash = "sha256:8fc3846806294cfa48afba7ec60e2407f849e6109638c1fa147fe8fac12fb6df", size = 10729 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/05/b08b55abd1b08376d5c4e13524cf1e6baa63473dee2cd58fd1725aa896a6/local_attention-1.10.0-py3-none-any.whl", hash = "sha256:f558b8a275f8475e16df602f0d856887dd44cd3ef7d4340aced936445b29e326", size = 9334 },
 ]
 
 [[package]]
@@ -1006,6 +1037,21 @@ wheels = [
 ]
 
 [[package]]
+name = "performer-pytorch"
+version = "1.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "axial-positional-embedding" },
+    { name = "einops" },
+    { name = "local-attention" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/0d/24a3c930a2d0a7e5439219083cbd5ef43ad7f8605078a4243eec50a68893/performer-pytorch-1.1.4.tar.gz", hash = "sha256:90f29ec0417ff68be4cd1c3d6b4005cc23f60a6ea34d182295b11571dab3d53c", size = 14875 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/28/52/d12a977a3314101c95636ca7c742d829fcc28a9e89282ad4eba89b2801cb/performer_pytorch-1.1.4-py3-none-any.whl", hash = "sha256:8c27835741950c7b5f39d8f98056416b752c4bce9426c4c4c4b9757ba7c55fc7", size = 13314 },
+]
+
+[[package]]
 name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1111,8 +1157,6 @@ version = "6.1.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/26/10/2a30b13c61e7cf937f4adf90710776b7918ed0a9c434e2c38224732af310/psutil-6.1.0.tar.gz", hash = "sha256:353815f59a7f64cdaca1c0307ee13558a0512f6db064e92fe833784f08539c7a", size = 508565 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/da/2b/f4dea5d993d9cd22ad958eea828a41d5d225556123d372f02547c29c4f97/psutil-6.1.0-cp27-none-win32.whl", hash = "sha256:9118f27452b70bb1d9ab3198c1f626c2499384935aaf55388211ad982611407e", size = 246648 },
-    { url = "https://files.pythonhosted.org/packages/9f/14/4aa97a7f2e0ac33a050d990ab31686d651ae4ef8c86661fef067f00437b9/psutil-6.1.0-cp27-none-win_amd64.whl", hash = "sha256:a8506f6119cff7015678e2bce904a4da21025cc70ad283a53b099e7620061d85", size = 249905 },
     { url = "https://files.pythonhosted.org/packages/01/9e/8be43078a171381953cfee33c07c0d628594b5dbfc5157847b85022c2c1b/psutil-6.1.0-cp36-abi3-macosx_10_9_x86_64.whl", hash = "sha256:6e2dcd475ce8b80522e51d923d10c7871e45f20918e027ab682f94f1c6351688", size = 247762 },
     { url = "https://files.pythonhosted.org/packages/1d/cb/313e80644ea407f04f6602a9e23096540d9dc1878755f3952ea8d3d104be/psutil-6.1.0-cp36-abi3-macosx_11_0_arm64.whl", hash = "sha256:0895b8414afafc526712c498bd9de2b063deaac4021a3b3c34566283464aff8e", size = 248777 },
     { url = "https://files.pythonhosted.org/packages/65/8e/bcbe2025c587b5d703369b6a75b65d41d1367553da6e3f788aff91eaf5bd/psutil-6.1.0-cp36-abi3-manylinux_2_12_i686.manylinux2010_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:9dcbfce5d89f1d1f2546a2090f4fcf87c7f669d1d90aacb7d7582addece9fb38", size = 284259 },
@@ -1493,10 +1537,11 @@ wheels = [
 
 [[package]]
 name = "simpler-flash"
-version = "1.0.4"
+version = "1.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "einops" },
+    { name = "performer-pytorch" },
     { name = "session-info" },
     { name = "torch" },
     { name = "torchaudio" },
@@ -1530,6 +1575,7 @@ requires-dist = [
     { name = "ipython", marker = "extra == 'doc'" },
     { name = "myst-nb", marker = "extra == 'doc'", specifier = ">=1.1" },
     { name = "pandas", marker = "extra == 'doc'" },
+    { name = "performer-pytorch", specifier = ">=1" },
     { name = "session-info" },
     { name = "setuptools", marker = "extra == 'doc'" },
     { name = "sphinx", marker = "extra == 'doc'", specifier = ">=4" },
@@ -1540,10 +1586,10 @@ requires-dist = [
     { name = "sphinxcontrib-bibtex", marker = "extra == 'doc'", specifier = ">=1" },
     { name = "sphinxext-opengraph", marker = "extra == 'doc'" },
     { name = "torch", specifier = "==2.2" },
-    { name = "torchaudio", specifier = ">=0.13" },
+    { name = "torchaudio", specifier = ">=2.2" },
     { name = "torchdata", specifier = ">=0.5" },
-    { name = "torchtext", specifier = ">=0.13" },
-    { name = "torchvision", specifier = ">=0.13" },
+    { name = "torchtext", specifier = ">=0.17" },
+    { name = "torchvision", specifier = ">=0.17" },
 ]
 
 [[package]]
@@ -1594,7 +1640,7 @@ dependencies = [
     { name = "sphinxcontrib-jsmath" },
     { name = "sphinxcontrib-qthelp" },
     { name = "sphinxcontrib-serializinghtml" },
-    { name = "tomli" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6f/6d/be0b61178fe2cdcb67e2a92fc9ebb488e3c51c4f74a36a7824c0adf23425/sphinx-8.1.3.tar.gz", hash = "sha256:43c1911eecb0d3e161ad78611bc905d1ad0e523e4ddc202a58a821773dc4c927", size = 8184611 }
 wheels = [
@@ -1669,6 +1715,7 @@ dependencies = [
     { name = "docutils" },
     { name = "pybtex" },
     { name = "pybtex-docutils" },
+    { name = "setuptools", marker = "python_full_version >= '3.12'" },
     { name = "sphinx" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c1/ce/054a8ec04063f9a27772fea7188f796edbfa382e656d3b76428323861f0e/sphinxcontrib_bibtex-2.6.3.tar.gz", hash = "sha256:7c790347ef1cb0edf30de55fc324d9782d085e89c52c2b8faafa082e08e23946", size = 117177 }
@@ -1738,7 +1785,7 @@ name = "sqlalchemy"
 version = "2.0.36"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'" },
+    { name = "greenlet", marker = "(python_full_version < '3.13' and platform_machine == 'AMD64') or (python_full_version < '3.13' and platform_machine == 'WIN32') or (python_full_version < '3.13' and platform_machine == 'aarch64') or (python_full_version < '3.13' and platform_machine == 'amd64') or (python_full_version < '3.13' and platform_machine == 'ppc64le') or (python_full_version < '3.13' and platform_machine == 'win32') or (python_full_version < '3.13' and platform_machine == 'x86_64')" },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/65/9cbc9c4c3287bed2499e05033e207473504dc4df999ce49385fb1f8b058a/sqlalchemy-2.0.36.tar.gz", hash = "sha256:7f2767680b6d2398aea7082e45a774b2b0767b5c8d8ffb9c8b683088ea9b29c5", size = 9574485 }

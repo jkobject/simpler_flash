@@ -4,7 +4,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
 import torch
 import triton
@@ -14,7 +13,6 @@ from einops import rearrange, reduce
 # from fla.ops.common.utils import prepare_chunk_indices
 # from fla.ops.utils.op import exp, log
 # from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem, contiguous
-
 from triton.language import exp, log
 
 
@@ -517,8 +515,8 @@ def parallel_softpick_attn_fwd(
     v: torch.Tensor,
     scale: float,
     chunk_size: int = 128,
-    offsets: Optional[torch.LongTensor] = None,
-    indices: Optional[torch.LongTensor] = None,
+    offsets: torch.LongTensor | None = None,
+    indices: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
@@ -591,8 +589,8 @@ def parallel_softpick_attn_bwd(
     do: torch.Tensor,
     scale: float = None,
     chunk_size: int = 128,
-    offsets: Optional[torch.LongTensor] = None,
-    indices: Optional[torch.LongTensor] = None,
+    offsets: torch.LongTensor | None = None,
+    indices: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
@@ -738,8 +736,8 @@ def parallel_softpick_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
 ) -> torch.Tensor:
     r"""
@@ -760,7 +758,8 @@ def parallel_softpick_attn(
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format. Default: `False`.
 
-    Returns:
+    Returns
+    -------
         o (torch.Tensor):
             Outputs of shape `[B, T, HQ, V]` if `head_first=False` else `[B, HQ, T, V]`.
     """
@@ -769,7 +768,7 @@ def parallel_softpick_attn(
     if cu_seqlens is not None:
         assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
     if head_first:
-        q, k, v = map(lambda x: rearrange(x, "b h t d -> b t h d"), (q, k, v))
+        q, k, v = (rearrange(x, "b h t d -> b t h d") for x in (q, k, v))
     o = ParallelSoftpickAttentionFunction.apply(q, k, v, scale, cu_seqlens)
     if head_first:
         o = rearrange(o, "b t h d -> b h t d")
