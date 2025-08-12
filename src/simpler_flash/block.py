@@ -84,8 +84,8 @@ class Block(nn.Module):
         self.mixer = mixer_cls(dim)
         if cross_attn:
             if self.mixer.attn_type == "criss-cross":
-                raise NotImplementedError(
-                    "Criss-cross attention is not implemented for self-attention"
+                print(
+                    "Criss-cross attention only works for self-attention, using regular attn for this..."
                 )
             self.cross_attn = cross_attn(dim)
             self.dropout3 = dropout_cls(resid_dropout1)

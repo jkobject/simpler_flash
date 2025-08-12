@@ -6,13 +6,13 @@
 [badge-tests]: https://img.shields.io/github/actions/workflow/status/jkobject/simpler_flash/test.yaml?branch=main
 [badge-docs]: https://img.shields.io/readthedocs/simpler_flash
 
-a simpler version of flashattention. just pip install it with conda or with uv, have a compatible gpu and it should work.
+a full on suite of fast flash attention mechanisms, flashattention, flash-hyperattention, flash-softpick attention, flash-adasplash, flash criss-cross attention. just pip install it with conda or with uv, have a compatible gpu and it should work.
 
 installs in 1 sec without anything complex.
 
 ## Installation
 
-You need to use Python 3.10.
+You need to use Python 3.10+.
 
 There are several alternative options to install simpler_flash:
 
@@ -27,6 +27,8 @@ pip install simpler_flash
 ```bash
 pip install git+https://github.com/jkobject/simpler_flash.git@main
 ```
+
+in some old GPUs, you might need to use a lower block dim, for now it just has to be updated in the source code directly e.g. setting MAX_BLOCK_SIZE=64 instead of 128. it will reduce your max head size to 64
 
 ## Usage
 

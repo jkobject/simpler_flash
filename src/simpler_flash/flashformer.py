@@ -53,7 +53,6 @@ class FlashTransformer(nn.Module):
         sketcher_size: int = 200,
         sketcher_dim: int = 128,
         cross_dim: int = 128,
-        softpick: bool = False,
         **mha_kwargs,
     ):
         """
@@ -76,10 +75,12 @@ class FlashTransformer(nn.Module):
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
             drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
             attn_type (str, optional): The attention type. Defaults to "flash".
-                - "flash": Use flash attention.
+                - "flash": Use flash attention (fast)
                 - "normal": Use regular MHA attention.
-                - "hyper": Use HyperAttention.
-                - "criss-cross": Use Criss-Cross attention.
+                - "hyper": Use HyperAttention. (not great..)
+                - "criss-cross": Use Criss-Cross attention (even faster)
+                - "softpick": Use SoftPick attention. (really not great...)
+                - "adasplash": Use adasplash sparse attention model.
             weight_init (str, optional): The weight initialization method. Defaults to "".
             sketcher_size (int, optional): The size of the sketcher. Defaults to 200.
             sketcher_dim (int, optional): The dimension of the sketcher. Defaults to 128.
@@ -111,11 +112,13 @@ class FlashTransformer(nn.Module):
                     num_heads_kv=num_heads_kv,
                     dropout=dropout,
                     causal=False,
-                    attn_type=attn_type,
+                    attn_type=attn_type
+                    if attn_type not in ["softpick", "criss-cross"]
+                    else "flash",
                     layer_idx=(i * 2),
                     cross_attn=True,
                     cross_dim=cross_dim,
-                    softpick=softpick,
+                    softpick=attn_type == "softpick",
                 )
             else:
                 cross_attention = None
@@ -125,13 +128,13 @@ class FlashTransformer(nn.Module):
                 num_heads_kv=num_heads_kv,
                 dropout=dropout,
                 causal=False,
-                attn_type=attn_type,
+                attn_type=attn_type if attn_type != "softpick" else "flash",
                 cross_attn=False,
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else (i * 2) + 1,
                 sketcher_dim=sketcher_dim,
-                softpick=softpick,
+                softpick=attn_type == "softpick",
                 **mha_kwargs,
             )
             # or use parallelBlock where attn & MLP are done in parallel

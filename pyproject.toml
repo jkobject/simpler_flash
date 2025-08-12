@@ -25,12 +25,13 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "adasplash",
   "einops>=0.6.1",
   "performer-pytorch>=1",
 
   # for debug logging (referenced from the issue template)
   "session-info",
-  "torch==2.2",
+  "torch>=2.2",
   "torchaudio>=2.2",
   "torchdata>=0.5",
   "torchtext>=0.17",

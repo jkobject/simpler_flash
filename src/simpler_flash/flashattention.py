@@ -12,11 +12,11 @@ https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention
 Changes:
 - Implement both causal and non-causal attention.
 - Implement both self-attention and cross-attention.
-- Support arbitrary seqlens (not just multiples of 128), for both forward and backward.
-- Support all head dimensions up to 128 (not just 16, 32, 64, 128), for both forward and backward.
+- Support arbitrary seqlens (not just multiples of MAX_BLOCK_SIZE), for both forward and backward.
+- Support all head dimensions up to MAX_BLOCK_SIZE (not just 16, 32, 64, MAX_BLOCK_SIZE), for both forward and backward.
 - Support attention bias.
 - Speed up the forward pass a bit, and only store the LSE instead of m and l.
-- Make the backward for d=128 much faster by reducing register spilling.
+- Make the backward for d=64 much faster by reducing register spilling.
 - Optionally parallelize the backward pass across seqlen_k, to deal with the case of
 small batch size * nheads.
 
@@ -24,10 +24,10 @@ Caution:
 - This is an *experimental* implementation. The forward pass should be quite robust but
 I'm not 100% sure that the backward pass doesn't have race conditions (due to the Triton compiler).
 - This implementation has only been tested on A100.
-- If you plan to use headdim other than 64 and 128, you should test for race conditions
+- If you plan to use headdim other than 64 and MAX_BLOCK_SIZE, you should test for race conditions
 (due to the Triton compiler), as done in tests/test_flash_attn.py
 "test_flash_attn_triton_race_condition". I've tested and fixed many race conditions
-for different head dimensions (40, 48, 64, 128, 80, 88, 96), but I'm still not 100% confident
+for different head dimensions (40, 48, 64, MAX_BLOCK_SIZE, 80, 88, 96), but I'm still not 100% confident
 that there are none left for other head dimensions.
 
 Differences between this Triton version and the CUDA version:
@@ -45,11 +45,13 @@ import torch
 import triton
 import triton.language as tl
 
+MAX_BLOCK_SIZE = 128
 
-# Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
+
+# Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=MAX_BLOCK_SIZE
 # @triton.autotune(
 #     configs=[
-#         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+#         triton.Config({"BLOCK_M": MAX_BLOCK_SIZE, "BLOCK_N": MAX_BLOCK_SIZE}, num_warps=4, num_stages=1),
 #         # This config has a race condition when EVEN_M == False, disabling it for now.
 #         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
 #     ],
@@ -571,7 +573,7 @@ def _bwd_kernel_one_col_block(
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m_curr = start_m + offs_m
         # load q, k, v, do on-chip
-        # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
+        # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(MAX_BLOCK_SIZE, 117)
         if EVEN_M & EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
@@ -648,7 +650,7 @@ def _bwd_kernel_one_col_block(
         dv += tl.dot(tl.trans(p.to(do.dtype)), do)
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
-        # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
+        # Also wrong for headdim=MAX_BLOCK_SIZE, seqlen=(108, 256), and ATOMIC_ADD=True
         # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
@@ -660,7 +662,7 @@ def _bwd_kernel_one_col_block(
         # Putting the subtraction after the dp matmul (instead of before) is slightly faster
         Di = tl.load(D + offs_m_curr)
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
-        # for BLOCK_HEADDIM=128
+        # for BLOCK_HEADDIM=MAX_BLOCK_SIZE
         ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
         # compute dk = dot(ds.T, q)
         dk += tl.dot(tl.trans(ds), q)
@@ -750,21 +752,29 @@ def init_to_zero(name):
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": False},
+            {
+                "BLOCK_M": MAX_BLOCK_SIZE,
+                "BLOCK_N": MAX_BLOCK_SIZE,
+                "SEQUENCE_PARALLEL": False,
+            },
             num_warps=8,
             num_stages=1,
             pre_hook=init_to_zero("DQ"),
         ),
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": True},
+            {
+                "BLOCK_M": MAX_BLOCK_SIZE,
+                "BLOCK_N": MAX_BLOCK_SIZE,
+                "SEQUENCE_PARALLEL": True,
+            },
             num_warps=8,
             num_stages=1,
             pre_hook=init_to_zero("DQ"),
         ),
-        # Other configs seem to give wrong results when seqlen_q % 128 != 0, disabling them for now
-        # # Kernel is buggy (give wrong result) if we set BLOCK_m=128, BLOCK_n=64, num_warps=*4*
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
+        # Other configs seem to give wrong results when seqlen_q % MAX_BLOCK_SIZE != 0, disabling them for now
+        # # Kernel is buggy (give wrong result) if we set BLOCK_m=MAX_BLOCK_SIZE, BLOCK_n=64, num_warps=*4*
+        # triton.Config({"BLOCK_M": MAX_BLOCK_SIZE, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
+        # triton.Config({"BLOCK_M": MAX_BLOCK_SIZE, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
     ],
@@ -956,7 +966,7 @@ def _flash_attn_forward(
     _, seqlen_k, nheads, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    assert d <= 128, "FlashAttention only support head dimensions up to 128"
+    assert d <= MAX_BLOCK_SIZE, "FlashAttention only support head dimensions up to 64"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -983,7 +993,7 @@ def _flash_attn_forward(
         (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
     )
 
-    seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
+    seqlen_q_rounded = math.ceil(seqlen_q / MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
     lse = torch.empty(
         (batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32
     )
@@ -993,7 +1003,7 @@ def _flash_attn_forward(
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    BLOCK = 128
+    BLOCK = MAX_BLOCK_SIZE
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
     _fwd_kernel[grid](
@@ -1046,9 +1056,9 @@ def _flash_attn_backward(
         do = do.contiguous()
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
-    # assert d in {16, 32, 64, 128}
-    assert d <= 128
-    seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
+    # assert d in {16, 32, 64, MAX_BLOCK_SIZE}
+    assert d <= MAX_BLOCK_SIZE
+    seqlen_q_rounded = math.ceil(seqlen_q / MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
     assert lse.shape == (batch, nheads, seqlen_q_rounded)
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
     assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1
@@ -1074,7 +1084,7 @@ def _flash_attn_backward(
         seqlen_q,
         seqlen_q_rounded,
         d,
-        BLOCK_M=128,
+        BLOCK_M=MAX_BLOCK_SIZE,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
     )
 
@@ -1098,7 +1108,7 @@ def _flash_attn_backward(
         (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
     )
 
-    # BLOCK_M = 128
+    # BLOCK_M = MAX_BLOCK_SIZE
     # BLOCK_N = 64
     # num_warps = 4
     grid = lambda META: (
