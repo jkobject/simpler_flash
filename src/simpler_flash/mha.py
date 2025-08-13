@@ -852,12 +852,6 @@ class MHA(nn.Module):
             assert key_padding_mask is None
             assert cu_seqlens is None and max_seqlen is None
             assert not self.dwconv
-
-        kwargs = (
-            {}  # "cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
-            if self.attn_type != "normal"
-            else {"key_padding_mask": key_padding_mask, **kwargs}
-        )
         seqlen_offset = (
             0
             if inference_params is None
@@ -903,9 +897,7 @@ class MHA(nn.Module):
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(
-                            self.inner_attn, qkv, **kwargs
-                        )
+                        context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv)
                 else:
                     context = self._update_kvcache_attention(
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
@@ -991,7 +983,6 @@ class MHA(nn.Module):
                             self.inner_cross_attn,
                             q,
                             kv if self.attn_type != "criss-cross" else cc_kv,
-                            **kwargs,
                         )
                 else:
                     context = self._update_kvcache_attention(q, kv, inference_params)
