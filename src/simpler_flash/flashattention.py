@@ -977,18 +977,17 @@ def _flash_attn_forward(
     if has_bias:
         assert bias.dtype in [q.dtype, torch.float]
         assert bias.is_cuda
-        assert bias.dim() == 4
         if bias.stride(-1) != 1:
             bias = bias.contiguous()
-        if bias.shape[2:] == (1, seqlen_k):
+        if bias.shape[1:] == (1, seqlen_k):
             bias_type = "vector"
-        elif bias.shape[2:] == (seqlen_q, seqlen_k):
+        elif bias.shape[1:] == (seqlen_q, seqlen_k):
             bias_type = "matrix"
         else:
             raise RuntimeError(
                 "Last 2 dimensions of bias must be (1, seqlen_k) or (seqlen_q, seqlen_k)"
             )
-        bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
+        bias = bias.expand(nheads, batch, seqlen_q, seqlen_k).transpose(1, 0)
     bias_strides = (
         (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
     )

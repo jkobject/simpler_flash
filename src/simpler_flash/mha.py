@@ -277,41 +277,29 @@ class SelfAttention(nn.Module):
         self.dropout = attention_dropout
         self.softpick = softpick
 
-    def forward(self, qkv, causal=None, key_padding_mask=None, bias=None):
+    def forward(self, qkv, causal=None, bias=None):
         """
         Implements the multihead softmax attention.
 
         Args:
             qkv: The tensor containing the query, key, and value. (B, S, 3, H, D)
             causal: if passed, will override self.causal
-            key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
-                False means to mask out. (B, S)
         """
         causal = self.causal if causal is None else causal
-        q, k, v = qkv.unbind(dim=2)
+        q, k, v = qkv.transpose(1,3).unbind(dim=2)
+        
         if not self.softpick:
-            output = nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=key_padding_mask,
-                dropout_p=self.dropout,
-                is_causal=causal,
-            )
+            if bias is not None:
+                bias = bias.unsqueeze(1).expand(bias.shape[0], k.shape[1], bias.shape[1], bias.shape[2])
+            output = nn.functional.scaled_dot_product_attention(q,k,v,dropout_p=self.dropout,is_causal=causal,attn_mask=bias)
+            output = output.transpose(1,2)
         else:
             softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
             batch_size, seqlen = qkv.shape[0], qkv.shape[1]
             scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-            if key_padding_mask is not None:
-                padding_mask = torch.full(
-                    (batch_size, seqlen),
-                    -10000.0,
-                    dtype=scores.dtype,
-                    device=scores.device,
-                )
-                padding_mask.masked_fill_(key_padding_mask, 0.0)
+            if bias is not None:
                 # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-                scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
+                scores = scores + bias
             if causal:
                 # "triu_tril_cuda_template" not implemented for 'BFloat16'
                 # So we have to construct the mask in float
@@ -351,55 +339,47 @@ class CrossAttention(nn.Module):
         self.drop = nn.Dropout(attention_dropout)
         self.softpick = softpick
 
-    def forward(self, q, kv, causal=None, key_padding_mask=None, bias=None):
+    def forward(self, q, kv, causal=None, bias=None):
         """Implements the multihead softmax attention.
 
         Args
             q: The tensor containing the query. (B, Sq, H, D)
             kv: The tensor containing the key and value. (B, Sk, 2, H_k, D)
             causal: if passed, will override self.causal
-            key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
-                False means to mask out. (B, Sk)
         """
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         causal = self.causal if causal is None else causal
-        seqlen_k = kv.shape[1]
-        assert kv.shape[0] == batch_size and kv.shape[4] == q.shape[3]
+        if bias is not None:
+            print('wont use bias for cross attention..')
         if kv.shape[3] != q.shape[2]:  # MQA/GQA
             kv = repeat(kv, "... hkv d -> ... (hkv g) d", g=q.shape[2] // kv.shape[3])
-        k, v = kv.unbind(dim=2)
-        softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-        if key_padding_mask is not None:
-            padding_mask = torch.full(
-                (batch_size, seqlen_k),
-                -10000.0,
-                dtype=scores.dtype,
-                device=scores.device,
+        k, v = kv.transpose(1,3).unbind(dim=2)
+        q = q.transpose(1,2)
+        if not self.softpick:
+            output = nn.functional.scaled_dot_product_attention(q,k,v,dropout_p=self.dropout,is_causal=causal)
+            output = output.transpose(1,2)
+        else:
+            assert kv.shape[0] == batch_size and kv.shape[4] == q.shape[3]
+            seqlen_k = kv.shape[1]
+            softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+            scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+            if bias is not None:
+                scores = scores + bias
+            if causal:
+                # causal mask needs to take into account the difference between seqlen_q and seqlen_k
+                row_idx = rearrange(
+                    torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1"
+                )
+                col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
+                causal_mask = col_idx > row_idx - seqlen_q
+                scores = scores.masked_fill(causal_mask, -10000.0)
+            attention = (
+                torch.softmax(scores, dim=-1, dtype=v.dtype)
+                if not self.softpick
+                else softpick(scores, dim=-1)
             )
-            padding_mask.masked_fill_(key_padding_mask, 0.0)
-            # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
-            scores = scores + rearrange(padding_mask, "b s -> b 1 1 s")
-        if causal:
-            # causal mask needs to take into account the difference between seqlen_q and seqlen_k
-            row_idx = rearrange(
-                torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1"
-            )
-            col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
-            sk = (
-                seqlen_k
-                if key_padding_mask is None
-                else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
-            )
-            causal_mask = col_idx > row_idx + sk - seqlen_q
-            scores = scores.masked_fill(causal_mask, -10000.0)
-        attention = (
-            torch.softmax(scores, dim=-1, dtype=v.dtype)
-            if not self.softpick
-            else softpick(scores, dim=-1)
-        )
-        attention_drop = self.drop(attention)
-        output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+            attention_drop = self.drop(attention)
+            output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
         return output
 
 
@@ -856,7 +836,7 @@ class MHA(nn.Module):
                 context = self._apply_rotary_update_kvcache_attention(
                     qkv[:, :, 0], qkv[:, :, 1:], inference_params
                 )
-        else:
+        else: #cross or criss_cross attn
             if self.cross_attn:
                 if not self.return_residual:
                     q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])
@@ -911,7 +891,7 @@ class MHA(nn.Module):
                 inference_params is None
                 or inference_params.seqlen_offset == 0
                 or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
-                or not self.attn_type == "flash"
+                or self.attn_type != "flash"
             ):
                 if self.rotary_emb_dim > 0:
                     q, kv = self.rotary_emb(
