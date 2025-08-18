@@ -45,7 +45,7 @@ import torch
 import triton
 import triton.language as tl
 
-MAX_BLOCK_SIZE = 64
+MAX_BLOCK_SIZE = 128
 
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=MAX_BLOCK_SIZE
@@ -966,7 +966,7 @@ def _flash_attn_forward(
     _, seqlen_k, nheads, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    assert d <= MAX_BLOCK_SIZE, "FlashAttention only support head dimensions up to " + MAX_BLOCK_SIZE
+    assert d <= MAX_BLOCK_SIZE, "FlashAttention only support head dimensions up to 64"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda

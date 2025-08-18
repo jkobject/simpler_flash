@@ -6,7 +6,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from adasplash import adasplash_no_block_mask
 from einops import rearrange, repeat
 
 from .hyper_attention import HyperAttention
@@ -83,44 +82,6 @@ class HyperCrossAttention(nn.Module):
     def forward(self, q, kv, bias=None):
         k, v = kv[:, :, 0, :, :], kv[:, :, 1, :, :]
         return self.hyper_attention(q, k, v)
-
-
-class AdasplashSelfAttention(nn.Module):
-    def __init__(self, alpha=2, niter=10, causal: bool = False):
-        super().__init__()
-        self.alpha = alpha
-        self.niter = niter
-        self.causal = causal
-
-    def forward(self, qkv, bias=None):
-        q = qkv[:, :, 0, :, :].contiguous()
-        k = qkv[:, :, 1, :, :].contiguous()
-        v = qkv[:, :, 2, :, :].contiguous()
-        return adasplash_no_block_mask(
-            q, k, v, is_causal=self.causal, alpha=self.alpha, niter=self.niter
-        )
-
-
-class AdasplashCrossAttention(nn.Module):
-    def __init__(
-        self,
-        alpha=2,
-        niter=10,
-        causal: bool = False,
-    ):
-        super().__init__()
-        self.alpha = alpha
-        self.niter = niter
-        self.causal = causal
-
-    def forward(self, q, kv, bias=None):
-        q = q.contiguous()
-        k = kv[:, :, 0, :, :].contiguous()
-        v = kv[:, :, 1, :, :].contiguous()
-
-        return adasplash_no_block_mask(
-            q, k, v, is_causal=self.causal, alpha=self.alpha, niter=self.niter
-        )
 
 
 class FlashSelfAttention(nn.Module):
@@ -521,8 +482,6 @@ class MHA(nn.Module):
         sketcher_dim: int = 128,
         cross_dim: int = 128,
         softpick: bool = False,
-        alpha: float = 2.0,
-        niter: int = 10,
     ) -> None:
         """
         MHA Multi-head self-attention and cross-attention
@@ -552,14 +511,11 @@ class MHA(nn.Module):
                 - "normal": Use regular MHA attention.
                 - "hyper": Use HyperAttention.
                 - "criss-cross": Use Criss-Cross attention.
-                - "adasplash": use the adasplash attention
             device (torch.device, optional): device. Defaults to None.
             dtype (torch.dtype, optional): dtype. Defaults to None.
             num_lsh_projections (int, optional): number of LSH projections in HyperAttention. Defaults to 8.
             block_size (int, optional): block size for LSH in HyperAttention. Defaults to 128.
             sketcher_dim (int, optional): dimension of the sketcher. Defaults to 128.
-            alpha (float, optional): amount of sparsity for Adasplash attention. Defaults to 2.0.
-            niter (int, optional): number of iterations for Adasplash sparse attention comp. Defaults to 10.
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -638,12 +594,8 @@ class MHA(nn.Module):
                 block_size=block_size,
                 lsh_num_projs=num_lsh_projections,
             )
-        elif self.attn_type == "adasplash":
-            inner_attn_cls = partial(
-                AdasplashSelfAttention,
-                alpha=alpha,
-                niter=niter,
-            )
+        else:
+            raise ValueError('attention must be one of ["flash", "criss-cross", "hyper"]')
         # cross attn stuff
         inner_cross_attn_cls = partial(
             CrossAttention,
@@ -651,7 +603,7 @@ class MHA(nn.Module):
             softmax_scale=softmax_scale,
             attention_dropout=dropout,
         )
-        if self.attn_type in ["flash", "adasplash", "criss-cross"]:
+        if self.attn_type in ["flash", "criss-cross"]:
             inner_cross_attn_cls = partial(
                 FlashCrossAttention,
                 alibi_slopes=alibi_slopes,
