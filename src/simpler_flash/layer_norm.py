@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch.amp import custom_bwd, custom_fwd
+from torch.cuda.amp import custom_bwd, custom_fwd
 
 
 def layer_norm_ref(
@@ -1041,7 +1041,7 @@ class RMSNorm(torch.nn.Module):
 
 class LayerNormLinearFn(torch.autograd.Function):
     @staticmethod
-    @custom_fwd(device_type="cuda")
+    @custom_fwd
     def forward(
         ctx,
         x,
@@ -1104,7 +1104,7 @@ class LayerNormLinearFn(torch.autograd.Function):
         return out if not prenorm else (out, residual_out.reshape(x_shape_og))
 
     @staticmethod
-    @custom_bwd(device_type="cuda")
+    @custom_bwd
     def backward(ctx, dout, *args):
         x, norm_weight, norm_bias, linear_weight, mean, rstd = ctx.saved_tensors
         dout = dout.reshape(-1, dout.shape[-1])
