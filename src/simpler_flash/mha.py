@@ -917,6 +917,8 @@ class MHA(nn.Module):
                     q, kv = self.rotary_emb(
                         q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
                     )
+                if "bias" in kwargs:
+                    kwargs.pop("bias")
                 if inference_params is None:
                     if not self.checkpointing:
                         if self.attn_type == "criss-cross":
