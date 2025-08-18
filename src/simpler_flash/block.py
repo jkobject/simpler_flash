@@ -234,7 +234,6 @@ class Block(nn.Module):
                 hidden_states,
                 x_kv=x_kv,
                 return_qkv=False,
-                bias=None,
                 key_padding_mask=src_key_padding_mask,
                 **mixer_kwargs,
             )
