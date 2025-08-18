@@ -11,15 +11,11 @@ from einops import rearrange, repeat
 from .hyper_attention import HyperAttention
 
 try:
-    from .flashattention import (
-        flash_attn_kvpacked_func,
-        flash_attn_qkvpacked_func,
-    )
+    from .flashattention import flash_attn_kvpacked_func, flash_attn_qkvpacked_func
     from .flashpickattention import (
         flash_pick_attn_kvpacked_func,
         flash_pick_attn_qkvpacked_func,
     )
-
 except ModuleNotFoundError as e:
     print(e)
     print("FlashAttention is not installed, not using it..")
@@ -69,7 +65,6 @@ class HyperCrossAttention(nn.Module):
         self,
         causal: bool = False,
         softmax_scale: float | None = None,
-        attention_dropout: float = 0.0,
         head_dim: int = 64,
         lsh_num_projs: int = 8,
         block_size: int = 128,
@@ -94,7 +89,6 @@ class FlashSelfAttention(nn.Module):
         self,
         causal: bool = False,
         softmax_scale: float | None = None,
-        attention_dropout: float = 0.0,
         alibi_slopes: Any | None = None,
         deterministic: bool = False,
         use_triton: bool = True,
@@ -116,7 +110,6 @@ class FlashSelfAttention(nn.Module):
             print("FlashAttention is not installed, using triton instead")
             use_triton = True
         self.use_triton = use_triton
-        self.attention_dropout = attention_dropout
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.softpick = softpick
@@ -154,14 +147,11 @@ class FlashSelfAttention(nn.Module):
         causal = self.causal if causal is None else causal
         if not self.use_triton:
             raise NotImplementedError("OpenAI's flashattention is not implemented")
-            # if qkv.stride(-1) != 1:
-            #    qkv = qkv.contiguous()
         else:
             if self.softpick:
                 return flash_pick_attn_qkvpacked_func(
                     qkv,
                     bias,
-                    # self.drop.p if self.training else 0.0,
                     causal,
                     self.softmax_scale,
                 )
@@ -171,7 +161,6 @@ class FlashSelfAttention(nn.Module):
                     bias,
                     causal,
                     self.softmax_scale,
-                    # self.attention_dropout,
                 )
 
 
@@ -201,7 +190,6 @@ class FlashCrossAttention(nn.Module):
         assert flash_attn_kvpacked_func is not None, "FlashAttention is not installed"
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.drop = nn.Dropout(attention_dropout)
         self.register_buffer("alibi_slopes", alibi_slopes, persistent=False)
         self.deterministic = deterministic
         self.use_triton = use_triton
@@ -247,7 +235,6 @@ class FlashCrossAttention(nn.Module):
                 q,
                 kv,
                 None,
-                # self.drop.p if self.training else 0.0,
                 causal,
                 self.softmax_scale,
                 # alibi_slopes=self.alibi_slopes,
@@ -260,7 +247,6 @@ class FlashCrossAttention(nn.Module):
                 None,
                 causal,
                 self.softmax_scale,
-                # self.attention_dropout,
             )
 
 
@@ -352,11 +338,18 @@ class CrossAttention(nn.Module):
         attention_dropout: The dropout rate to apply to the attention. default to 0.0.
     """
 
-    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+    def __init__(
+        self,
+        causal=False,
+        softmax_scale=None,
+        attention_dropout=0.0,
+        softpick: bool = False,
+    ):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.drop = nn.Dropout(attention_dropout)
+        self.softpick = softpick
 
     def forward(self, q, kv, causal=None, key_padding_mask=None, bias=None):
         """Implements the multihead softmax attention.
@@ -581,12 +574,18 @@ class MHA(nn.Module):
         )
         wqkv_cls = linear_cls if not self.return_residual else linear_resid_cls
 
-        inner_attn_cls = partial(SelfAttention, softpick=self.softpick)
-        if self.attn_type == "flash":
+        inner_attn_cls = partial(
+            SelfAttention,
+            softpick=self.softpick,
+            softmax_scale=softmax_scale,
+            attention_dropout=dropout,
+        )
+        if self.attn_type in ["flash", "criss-cross"]:
             inner_attn_cls = partial(
                 FlashSelfAttention,
                 alibi_slopes=alibi_slopes,
                 softpick=self.softpick,
+                softmax_scale=softmax_scale,
             )
         elif self.attn_type == "hyper":
             inner_attn_cls = partial(
@@ -595,12 +594,21 @@ class MHA(nn.Module):
                 block_size=block_size,
                 lsh_num_projs=num_lsh_projections,
             )
-        inner_cross_attn_cls = partial(CrossAttention, softpick=self.softpick)
-        if self.attn_type == "flash":
+        else:
+            raise ValueError('attention must be one of ["flash", "criss-cross", "hyper"]')
+        # cross attn stuff
+        inner_cross_attn_cls = partial(
+            CrossAttention,
+            softpick=self.softpick,
+            softmax_scale=softmax_scale,
+            attention_dropout=dropout,
+        )
+        if self.attn_type in ["flash", "criss-cross"]:
             inner_cross_attn_cls = partial(
                 FlashCrossAttention,
                 alibi_slopes=alibi_slopes,
                 softpick=self.softpick,
+                softmax_scale=softmax_scale,
             )
         elif self.attn_type == "hyper":
             inner_cross_attn_cls = partial(
@@ -633,16 +641,10 @@ class MHA(nn.Module):
             self.Wqkv_criss_cross = wqkv_cls(sketcher_dim, qkv_dim, **factory_kwargs)
         self.inner_attn = inner_attn_cls(
             causal=causal,
-            softmax_scale=softmax_scale,
-            attention_dropout=dropout,
         )
-        self.inner_cross_attn = inner_cross_attn_cls(
-            causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
-        )
+        self.inner_cross_attn = inner_cross_attn_cls(causal=causal)
         if self.attn_type == "criss-cross":
-            self.inner_criss_cross_attn = inner_cross_attn_cls(
-                causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
-            )
+            self.inner_criss_cross_attn = inner_cross_attn_cls(causal=causal)
             self.out_criss_cross = linear_cls(
                 embed_dim,
                 sketcher_dim,
