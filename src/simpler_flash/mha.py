@@ -594,8 +594,6 @@ class MHA(nn.Module):
                 block_size=block_size,
                 lsh_num_projs=num_lsh_projections,
             )
-        else:
-            raise ValueError('attention must be one of ["flash", "criss-cross", "hyper"]')
         # cross attn stuff
         inner_cross_attn_cls = partial(
             CrossAttention,
