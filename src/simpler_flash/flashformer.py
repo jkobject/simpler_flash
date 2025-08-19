@@ -179,13 +179,17 @@ class FlashTransformer(nn.Module):
         self,
         hidden_states: Tensor,
         x_kv: Tensor | None = None,
-        return_qkv=[],
+        return_qkv: list[int] | None = None,
         bias: Tensor | None = None,
-        bias_layer=[],
+        bias_layer: list[int] | None = None,
         mask_zeros: Tensor | None = None,
     ) -> Tensor:
         residual = None
         qkvs = []
+        if return_qkv is None:
+            return_qkv = []
+        if bias_layer is None:
+            bias_layer = []
         if not self.cross_attn and x_kv is not None:
             raise ValueError("x_kv must be None for self-attention")
         if bias is not None and bias.dim() == 2:
