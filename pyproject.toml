@@ -30,7 +30,7 @@ dependencies = [
 
   # for debug logging (referenced from the issue template)
   "session-info",
-  "torch==2.2",
+  "torch>=2.2",
   "torchaudio>=2.2",
   "torchdata>=0.5",
   "torchtext>=0.17",

@@ -45,7 +45,106 @@ import torch
 import triton
 import triton.language as tl
 
-MAX_BLOCK_SIZE = 128
+
+def get_optimal_block_size():
+    """
+    Dynamically determine the optimal block size based on GPU shared memory capabilities.
+    This helps maximize performance while avoiding OutOfResources errors on different GPU architectures.
+    """
+    try:
+        # Get current device properties
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
+        
+        # Get shared memory per block in bytes
+        shared_mem_per_block = props.shared_memory_per_block
+        
+        # Estimate memory usage for different block sizes
+        # The kernel uses roughly: BLOCK_M * BLOCK_N * (2 * sizeof(float16) + overhead)
+        # Plus additional memory for intermediate computations
+        # This is a conservative estimation based on the FlashAttention kernel requirements
+        
+        # For safety, use only 90% of available shared memory to account for:
+        # - Compiler optimizations and register spilling
+        # - Other kernel overhead
+        # - Triton's internal memory management
+        usable_shared_mem = int(shared_mem_per_block * 0.9)
+        
+        # Rough memory estimation per element in shared memory (in bytes)
+        # Each element needs space for Q, K, V matrices plus intermediate calculations
+        bytes_per_element = 8  # Conservative estimate for fp16/bf16 + overhead
+        
+        # Test block sizes in descending order of preference
+        candidate_block_sizes = [128, 64, 32]
+        
+        for block_size in candidate_block_sizes:
+            # Estimate memory usage for this block size
+            # Main memory usage: BLOCK_M * BLOCK_N matrix operations
+            estimated_memory = block_size * block_size * bytes_per_element
+            
+            # Add some overhead for intermediate computations (attention scores, etc.)
+            estimated_memory = int(estimated_memory * 1.1)
+            
+            if estimated_memory <= usable_shared_mem:
+                print(f"FlashAttention: Selected block size {block_size} for device {device} "
+                      f"(shared memory: {shared_mem_per_block} bytes, estimated usage: {estimated_memory} bytes)")
+                return block_size
+        
+        # Fallback to smallest size if nothing fits
+        print(f"FlashAttention: Warning - using fallback block size 16 for device {device} "
+              f"(shared memory: {shared_mem_per_block} bytes)")
+        return 16
+        
+    except Exception as e:
+        # Fallback in case of any issues with device detection
+        print(f"FlashAttention: Error detecting optimal block size ({e}), using default 64")
+        return 64
+
+
+# Cache the block size per device to avoid repeated computation
+_cached_block_sizes = {}
+
+def get_max_block_size():
+    """Get the maximum block size for the current device, with caching."""
+    if not torch.cuda.is_available():
+        return 64  # Default fallback when CUDA is not available
+    
+    device = torch.cuda.current_device()
+    if device not in _cached_block_sizes:
+        _cached_block_sizes[device] = get_optimal_block_size()
+    return _cached_block_sizes[device]
+
+
+def set_max_block_size(block_size, device=None):
+    """
+    Manually override the block size for a specific device.
+    Useful for debugging or when automatic detection fails.
+    
+    Args:
+        block_size (int): The block size to use (must be power of 2)
+        device (int, optional): CUDA device ID. If None, uses current device.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    
+    if block_size not in [16, 32, 64, 128]:
+        print(f"Warning: Unusual block size {block_size}. Recommended values are 16, 32, 64, or 128.")
+    
+    _cached_block_sizes[device] = block_size
+    print(f"FlashAttention: Manually set block size to {block_size} for device {device}")
+
+
+def clear_block_size_cache():
+    """Clear the block size cache, forcing re-detection on next use."""
+    global _cached_block_sizes
+    _cached_block_sizes.clear()
+
+
+# Initialize with a reasonable default, will be updated when first used
+try:
+    MAX_BLOCK_SIZE = get_max_block_size() if torch.cuda.is_available() else 64
+except:
+    MAX_BLOCK_SIZE = 64  # Safe fallback
 
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=MAX_BLOCK_SIZE
@@ -966,7 +1065,8 @@ def _flash_attn_forward(
     _, seqlen_k, nheads, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    assert d <= MAX_BLOCK_SIZE, "FlashAttention only support head dimensions up to 64"
+    current_max_block_size = get_max_block_size()
+    assert d <= current_max_block_size, f"FlashAttention only support head dimensions up to {current_max_block_size}"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -992,7 +1092,8 @@ def _flash_attn_forward(
         (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
     )
 
-    seqlen_q_rounded = math.ceil(seqlen_q / MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
+    # Use the current_max_block_size already determined above
+    seqlen_q_rounded = math.ceil(seqlen_q / current_max_block_size) * current_max_block_size
     lse = torch.empty(
         (batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32
     )
@@ -1002,7 +1103,7 @@ def _flash_attn_forward(
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    BLOCK = MAX_BLOCK_SIZE
+    BLOCK = current_max_block_size
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
     _fwd_kernel[grid](
@@ -1055,9 +1156,11 @@ def _flash_attn_backward(
         do = do.contiguous()
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
-    # assert d in {16, 32, 64, MAX_BLOCK_SIZE}
-    assert d <= MAX_BLOCK_SIZE
-    seqlen_q_rounded = math.ceil(seqlen_q / MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
+    # Get optimal block size for current device
+    current_max_block_size = get_max_block_size()
+    # assert d in {16, 32, 64, current_max_block_size}
+    assert d <= current_max_block_size
+    seqlen_q_rounded = math.ceil(seqlen_q / current_max_block_size) * current_max_block_size
     assert lse.shape == (batch, nheads, seqlen_q_rounded)
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
     assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1
@@ -1083,7 +1186,7 @@ def _flash_attn_backward(
         seqlen_q,
         seqlen_q_rounded,
         d,
-        BLOCK_M=MAX_BLOCK_SIZE,
+        BLOCK_M=current_max_block_size,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
     )
 
