@@ -84,7 +84,6 @@ def get_optimal_block_size():
             
             # Add some overhead for intermediate computations (attention scores, etc.)
             estimated_memory = int(estimated_memory * 1.1)
-            
             if estimated_memory <= usable_shared_mem:
                 print(f"FlashAttention: Selected block size {block_size} for device {device} "
                       f"(shared memory: {shared_mem_per_block} bytes, estimated usage: {estimated_memory} bytes)")
@@ -103,6 +102,7 @@ def get_optimal_block_size():
 
 # Cache the block size per device to avoid repeated computation
 _cached_block_sizes = {}
+
 
 def get_max_block_size():
     """Get the maximum block size for the current device, with caching."""
@@ -1065,8 +1065,7 @@ def _flash_attn_forward(
     _, seqlen_k, nheads, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    current_max_block_size = get_max_block_size()
-    assert d <= current_max_block_size, f"FlashAttention only support head dimensions up to {current_max_block_size}"
+    assert d <= MAX_BLOCK_SIZE, f"FlashAttention only support head dimensions up to {MAX_BLOCK_SIZE}"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -1093,7 +1092,7 @@ def _flash_attn_forward(
     )
 
     # Use the current_max_block_size already determined above
-    seqlen_q_rounded = math.ceil(seqlen_q / current_max_block_size) * current_max_block_size
+    seqlen_q_rounded = math.ceil(seqlen_q / MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
     lse = torch.empty(
         (batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32
     )
@@ -1103,7 +1102,7 @@ def _flash_attn_forward(
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    BLOCK = current_max_block_size
+    BLOCK = MAX_BLOCK_SIZE
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
     _fwd_kernel[grid](
@@ -1156,11 +1155,9 @@ def _flash_attn_backward(
         do = do.contiguous()
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
-    # Get optimal block size for current device
-    current_max_block_size = get_max_block_size()
-    # assert d in {16, 32, 64, current_max_block_size}
-    assert d <= current_max_block_size
-    seqlen_q_rounded = math.ceil(seqlen_q / current_max_block_size) * current_max_block_size
+    # assert d in {16, 32, 64, MAX_BLOCK_SIZE}
+    assert d <= MAX_BLOCK_SIZE
+    seqlen_q_rounded = math.ceil(seqlen_q / MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
     assert lse.shape == (batch, nheads, seqlen_q_rounded)
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
     assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1
@@ -1186,7 +1183,7 @@ def _flash_attn_backward(
         seqlen_q,
         seqlen_q_rounded,
         d,
-        BLOCK_M=current_max_block_size,
+        BLOCK_M=MAX_BLOCK_SIZE,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
     )
 
