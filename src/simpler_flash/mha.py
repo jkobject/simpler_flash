@@ -65,6 +65,7 @@ class HyperCrossAttention(nn.Module):
         self,
         causal: bool = False,
         softmax_scale: float | None = None,
+        attn_dropout: float = 0,
         head_dim: int = 64,
         lsh_num_projs: int = 8,
         block_size: int = 128,
@@ -93,6 +94,7 @@ class FlashSelfAttention(nn.Module):
         deterministic: bool = False,
         use_triton: bool = True,
         softpick: bool = False,
+        attn_dropout: float = 0.0,
     ):
         """Implement the scaled dot product attention with softmax.
 
@@ -194,7 +196,6 @@ class FlashCrossAttention(nn.Module):
         self.deterministic = deterministic
         self.use_triton = use_triton
         self.softpick = softpick
-        self.attention_dropout = attention_dropout
 
     def forward(
         self,
@@ -273,7 +274,6 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.drop = nn.Dropout(attention_dropout)
         self.dropout = attention_dropout
         self.softpick = softpick
 
@@ -286,16 +286,20 @@ class SelfAttention(nn.Module):
             causal: if passed, will override self.causal
         """
         causal = self.causal if causal is None else causal
-        q, k, v = qkv.transpose(1,3).unbind(dim=2)
-        
+        q, k, v = qkv.transpose(1, 3).unbind(dim=2)
+
         if not self.softpick:
             if bias is not None:
-                bias = bias.unsqueeze(1).expand(bias.shape[0], k.shape[1], bias.shape[1], bias.shape[2])
-            output = nn.functional.scaled_dot_product_attention(q,k,v,dropout_p=self.dropout,is_causal=causal,attn_mask=bias)
-            output = output.transpose(1,2)
+                bias = bias.unsqueeze(1).expand(
+                    bias.shape[0], k.shape[1], bias.shape[1], bias.shape[2]
+                )
+            output = nn.functional.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.dropout, is_causal=causal, attn_mask=bias
+            )
+            output = output.transpose(1, 2)
         else:
             softmax_scale = self.softmax_scale or 1.0 / math.sqrt(q.shape[-1])
-            batch_size, seqlen = qkv.shape[0], qkv.shape[1]
+            _, seqlen = qkv.shape[0], qkv.shape[1]
             scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
             if bias is not None:
                 # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
@@ -336,7 +340,7 @@ class CrossAttention(nn.Module):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.drop = nn.Dropout(attention_dropout)
+        self.dropout = attention_dropout
         self.softpick = softpick
 
     def forward(self, q, kv, causal=None, bias=None):
@@ -350,14 +354,16 @@ class CrossAttention(nn.Module):
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         causal = self.causal if causal is None else causal
         if bias is not None:
-            print('wont use bias for cross attention..')
+            print("wont use bias for cross attention..")
         if kv.shape[3] != q.shape[2]:  # MQA/GQA
             kv = repeat(kv, "... hkv d -> ... (hkv g) d", g=q.shape[2] // kv.shape[3])
-        k, v = kv.transpose(1,3).unbind(dim=2)
-        q = q.transpose(1,2)
+        k, v = kv.transpose(1, 3).unbind(dim=2)
+        q = q.transpose(1, 2)
         if not self.softpick:
-            output = nn.functional.scaled_dot_product_attention(q,k,v,dropout_p=self.dropout,is_causal=causal)
-            output = output.transpose(1,2)
+            output = nn.functional.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.dropout, is_causal=causal
+            )
+            output = output.transpose(1, 2)
         else:
             assert kv.shape[0] == batch_size and kv.shape[4] == q.shape[3]
             seqlen_k = kv.shape[1]
@@ -462,6 +468,7 @@ class MHA(nn.Module):
         sketcher_dim: int = 128,
         cross_dim: int = 128,
         softpick: bool = False,
+        attn_dropout: float = 0,
     ) -> None:
         """
         MHA Multi-head self-attention and cross-attention
@@ -495,6 +502,7 @@ class MHA(nn.Module):
             dtype (torch.dtype, optional): dtype. Defaults to None.
             num_lsh_projections (int, optional): number of LSH projections in HyperAttention. Defaults to 8.
             block_size (int, optional): block size for LSH in HyperAttention. Defaults to 128.
+            attn_dropout (float, optional): the amount of dropout in the attention matrices.
             sketcher_dim (int, optional): dimension of the sketcher. Defaults to 128.
         """
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -505,6 +513,7 @@ class MHA(nn.Module):
         self.causal = causal
         self.layer_idx = layer_idx
         self.dwconv = dwconv
+        self.attn_dropout = attn_dropout
         self.rotary_emb_dim = rotary_emb_dim
         self.attn_type = attn_type
         self.softpick = softpick
@@ -558,9 +567,9 @@ class MHA(nn.Module):
             SelfAttention,
             softpick=self.softpick,
             softmax_scale=softmax_scale,
-            attention_dropout=dropout,
+            attention_dropout=self.attn_dropout,
         )
-        if self.attn_type in ["flash", "criss-cross"]:
+        if self.attn_type == "flash":
             inner_attn_cls = partial(
                 FlashSelfAttention,
                 alibi_slopes=alibi_slopes,
@@ -579,9 +588,9 @@ class MHA(nn.Module):
             CrossAttention,
             softpick=self.softpick,
             softmax_scale=softmax_scale,
-            attention_dropout=dropout,
+            attention_dropout=self.attn_dropout,
         )
-        if self.attn_type in ["flash", "criss-cross"]:
+        if self.attn_type == "flash":
             inner_cross_attn_cls = partial(
                 FlashCrossAttention,
                 alibi_slopes=alibi_slopes,
@@ -836,7 +845,7 @@ class MHA(nn.Module):
                 context = self._apply_rotary_update_kvcache_attention(
                     qkv[:, :, 0], qkv[:, :, 1:], inference_params
                 )
-        else: #cross or criss_cross attn
+        else:  # cross or criss_cross attn
             if self.cross_attn:
                 if not self.return_residual:
                     q = self.Wq(x if mixer_subset is None else x[:, mixer_subset])

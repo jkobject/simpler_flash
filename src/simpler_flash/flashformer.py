@@ -38,6 +38,7 @@ class FlashTransformer(nn.Module):
         nlayers: int,
         num_heads_kv: int | None = None,
         dropout: float = 0.1,
+        attn_dropout: float = 0.0,
         cross_attn: bool = False,  # if True, becomes a decoder
         residual_in_fp32: bool = True,
         checkpointing: bool = False,
@@ -110,6 +111,7 @@ class FlashTransformer(nn.Module):
                     num_heads=nhead,
                     num_heads_kv=num_heads_kv,
                     dropout=dropout,
+                    attn_dropout=attn_dropout,
                     causal=False,
                     attn_type=attn_type
                     if attn_type not in ["softpick", "criss-cross"]
@@ -133,6 +135,7 @@ class FlashTransformer(nn.Module):
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else (i * 2) + 1,
                 sketcher_dim=sketcher_dim,
+                attn_dropout=attn_dropout,
                 softpick=attn_type == "softpick",
                 **mha_kwargs,
             )
