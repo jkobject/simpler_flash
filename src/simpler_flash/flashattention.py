@@ -55,48 +55,48 @@ def get_optimal_block_size():
         # Get current device properties
         device = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device)
-        
+
         # Get shared memory per block in bytes
         shared_mem_per_block = props.shared_memory_per_block
-        
+
         # Estimate memory usage for different block sizes
         # The kernel uses roughly: BLOCK_M * BLOCK_N * (2 * sizeof(float16) + overhead)
         # Plus additional memory for intermediate computations
         # This is a conservative estimation based on the FlashAttention kernel requirements
-        
+
         # For safety, use only 90% of available shared memory to account for:
         # - Compiler optimizations and register spilling
         # - Other kernel overhead
         # - Triton's internal memory management
         usable_shared_mem = int(shared_mem_per_block * 0.9)
-        
+
         # Rough memory estimation per element in shared memory (in bytes)
         # Each element needs space for Q, K, V matrices plus intermediate calculations
         bytes_per_element = 8  # Conservative estimate for fp16/bf16 + overhead
-        
+
         # Test block sizes in descending order of preference
         candidate_block_sizes = [128, 64, 32]
-        
+
         for block_size in candidate_block_sizes:
             # Estimate memory usage for this block size
             # Main memory usage: BLOCK_M * BLOCK_N matrix operations
             estimated_memory = block_size * block_size * bytes_per_element
-            
+
             # Add some overhead for intermediate computations (attention scores, etc.)
             estimated_memory = int(estimated_memory * 1.1)
             if estimated_memory <= usable_shared_mem:
-                print(f"FlashAttention: Selected block size {block_size} for device {device} "
-                      f"(shared memory: {shared_mem_per_block} bytes, estimated usage: {estimated_memory} bytes)")
+                # print(f"Legacy-FlashAttention: Selected block size {block_size} for device {device} "
+                #      f"(shared memory: {shared_mem_per_block} bytes, estimated usage: {estimated_memory} bytes)")
                 return block_size
-        
+
         # Fallback to smallest size if nothing fits
-        print(f"FlashAttention: Warning - using fallback block size 16 for device {device} "
-              f"(shared memory: {shared_mem_per_block} bytes)")
+        # print(f"Legacy-FlashAttention: Warning - using fallback block size 16 for device {device} "
+        #      f"(shared memory: {shared_mem_per_block} bytes)")
         return 16
-        
-    except Exception as e:
+
+    except Exception:
         # Fallback in case of any issues with device detection
-        print(f"FlashAttention: Error detecting optimal block size ({e}), using default 64")
+        # print(f"Legacy-FlashAttention: Error detecting optimal block size ({e}), using default 64")
         return 64
 
 
@@ -108,7 +108,7 @@ def get_max_block_size():
     """Get the maximum block size for the current device, with caching."""
     if not torch.cuda.is_available():
         return 64  # Default fallback when CUDA is not available
-    
+
     device = torch.cuda.current_device()
     if device not in _cached_block_sizes:
         _cached_block_sizes[device] = get_optimal_block_size()
@@ -119,19 +119,21 @@ def set_max_block_size(block_size, device=None):
     """
     Manually override the block size for a specific device.
     Useful for debugging or when automatic detection fails.
-    
+
     Args:
         block_size (int): The block size to use (must be power of 2)
         device (int, optional): CUDA device ID. If None, uses current device.
     """
     if device is None:
         device = torch.cuda.current_device()
-    
+
     if block_size not in [16, 32, 64, 128]:
-        print(f"Warning: Unusual block size {block_size}. Recommended values are 16, 32, 64, or 128.")
-    
+        print(
+            f"Warning: Unusual block size {block_size}. Recommended values are 16, 32, 64, or 128."
+        )
+
     _cached_block_sizes[device] = block_size
-    print(f"FlashAttention: Manually set block size to {block_size} for device {device}")
+    # print(f"Legacy-FlashAttention: Manually set block size to {block_size} for device {device}")
 
 
 def clear_block_size_cache():
@@ -1065,7 +1067,9 @@ def _flash_attn_forward(
     _, seqlen_k, nheads, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    assert d <= MAX_BLOCK_SIZE, f"FlashAttention only support head dimensions up to {MAX_BLOCK_SIZE}"
+    assert (
+        d <= MAX_BLOCK_SIZE
+    ), f"FlashAttention only support head dimensions up to {MAX_BLOCK_SIZE}"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda

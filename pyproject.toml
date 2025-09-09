@@ -98,16 +98,17 @@ lint.select = [
   "W",      # Warning detected by Pycodestyle
 ]
 lint.ignore = [
-  "B006", #
-  "B008", # Errors from function calls in argument defaults. These are fine when the result is immutable.
-  "D100", # Missing docstring in public module
-  "D101", # Missing docstring in public class
-  "D102", # Missing docstring in public function
-  "D103", # Missing docstring in public class member
-  "D104", # Missing docstring in public package
-  "D105", # __magic__ methods are often self-explanatory, allow missing docstrings
-  "D107", # Missing docstring in __init__
-  "D200", # one line docstrings are fine
+  "B006",   #
+  "B008",   # Errors from function calls in argument defaults. These are fine when the result is immutable.
+  "BLE001",
+  "D100",   # Missing docstring in public module
+  "D101",   # Missing docstring in public class
+  "D102",   # Missing docstring in public function
+  "D103",   # Missing docstring in public class member
+  "D104",   # Missing docstring in public package
+  "D105",   # __magic__ methods are often self-explanatory, allow missing docstrings
+  "D107",   # Missing docstring in __init__
+  "D200",   # one line docstrings are fine
   # Disable one in each pair of mutually incompatible rules
   "D203",  # We don't want a blank line before a class docstring
   "D205",  # Missing docstring in public method
@@ -115,6 +116,7 @@ lint.ignore = [
   "D400",  # first line should end with a period [Bug: doesn't work with single-line docstrings]
   "D401",  # First line should be in imperative mood; try rephrasing
   "E501",  # line too long -> we accept long comment lines; formatter gets rid of long code lines
+  "E722",
   "E731",  # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
   "E741",  # allow I, O, l as variable names -> I is the identity matrix
   "F403",  #
@@ -122,6 +124,7 @@ lint.ignore = [
   "UP027",
   "UP038", #
 ]
+
 lint.per-file-ignores."*/__init__.py" = [ "F401" ]
 lint.per-file-ignores."docs/*" = [ "I" ]
 lint.per-file-ignores."tests/*" = [ "D" ]
