@@ -156,6 +156,7 @@ class Block(nn.Module):
         self,
         hidden_states: Tensor,
         x_kv: Tensor | None = None,
+        latent_kv: Tensor | None = None,
         residual: Tensor | None = None,
         bias: Tensor | None = None,
         is_causal: bool | None = None,
@@ -186,7 +187,7 @@ class Block(nn.Module):
             residual = (dropped + residual) if residual is not None else dropped
             hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
             if self.mixer.attn_type == "criss-cross":
-                x_kv = self.norm_cc(x_kv.to(dtype=self.norm_cc.weight.dtype))
+                latent_kv = self.norm_cc(latent_kv.to(dtype=self.norm_cc.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
@@ -213,8 +214,8 @@ class Block(nn.Module):
                 is_rms_norm=isinstance(self.norm1, RMSNorm),
             )
             if self.mixer.attn_type == "criss-cross":
-                x_kv = layer_norm_fn(
-                    x_kv,
+                latent_kv = layer_norm_fn(
+                    latent_kv,
                     self.norm_cc.weight,
                     self.norm_cc.bias,
                     residual=None,
@@ -268,7 +269,7 @@ class Block(nn.Module):
                 )
         hidden_states = self.mixer(
             hidden_states,
-            x_kv=x_kv if self.mixer.attn_type == "criss-cross" else None,
+            x_kv=latent_kv,
             return_qkv=return_qkv,
             bias=bias,
             key_padding_mask=src_key_padding_mask,
@@ -280,7 +281,7 @@ class Block(nn.Module):
         if mixer_subset is not None:
             residual = residual[:, mixer_subset]
         if self.mixer.attn_type == "criss-cross":
-            x_kv = hidden_states[1]
+            latent_kv = hidden_states[1]
             hidden_states = hidden_states[0]
         if not isinstance(self.mlp, nn.Identity):
             if not self.fused_dropout_add_ln:
@@ -316,7 +317,7 @@ class Block(nn.Module):
             # maybe in the future add a criss-cross mlp and don't forget to add the residual connection
             hidden_states = self.mlp(hidden_states)
             if self.mixer.attn_type == "criss-cross":
-                hidden_states = (hidden_states, x_kv)
+                hidden_states = (hidden_states, latent_kv)
         return (
             (hidden_states, residual)
             if not return_qkv

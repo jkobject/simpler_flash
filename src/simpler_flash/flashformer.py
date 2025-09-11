@@ -115,7 +115,7 @@ class FlashTransformer(nn.Module):
                     causal=False,
                     attn_type=attn_type
                     if attn_type not in ["softpick", "criss-cross"]
-                    else "flash",
+                    else "normal",
                     layer_idx=(i * 2),
                     cross_attn=True,
                     cross_dim=cross_dim,
@@ -129,7 +129,7 @@ class FlashTransformer(nn.Module):
                 num_heads_kv=num_heads_kv,
                 dropout=dropout,
                 causal=False,
-                attn_type=attn_type if attn_type != "softpick" else "flash",
+                attn_type=attn_type if attn_type != "softpick" else "normal",
                 cross_attn=False,
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
@@ -198,7 +198,7 @@ class FlashTransformer(nn.Module):
         if bias is not None and bias.dim() == 2:
             bias = bias.unsqueeze(0).unsqueeze(0)
         if self.attn_type == "criss-cross":
-            x_kv = self.learnt_latent(
+            latent_kv = self.learnt_latent(
                 torch.arange(
                     self.sketcher_size, dtype=torch.long, device=hidden_states.device
                 ).repeat(hidden_states.shape[0], 1)
@@ -207,6 +207,7 @@ class FlashTransformer(nn.Module):
             hidden_states = block(
                 hidden_states,
                 x_kv,
+                latent_kv if self.attn_type == "criss-cross" else None,
                 residual,
                 return_qkv=(i in return_qkv),
                 bias=bias if i in bias_layer else None,
@@ -218,7 +219,7 @@ class FlashTransformer(nn.Module):
             else:
                 hidden_states, residual = hidden_states
             if self.attn_type == "criss-cross":
-                x_kv = x_kv + hidden_states[1]
+                latent_kv = latent_kv + hidden_states[1]
                 hidden_states = hidden_states[0]
         if not self.fused_dropout_add_ln:
             residual = self.drop_path(self.dropout(hidden_states)) + residual
