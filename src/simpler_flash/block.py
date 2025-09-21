@@ -163,6 +163,7 @@ class Block(nn.Module):
         src_key_padding_mask: Tensor | None = None,
         mixer_subset: Tensor | None = None,
         mixer_kwargs: dict[str, Any] | None = None,
+        drop_self: bool = False,
         return_qkv: bool = False,
     ):
         r"""Pass the input through the encoder layer.
@@ -267,6 +268,8 @@ class Block(nn.Module):
                     residual_in_fp32=self.residual_in_fp32,
                     is_rms_norm=isinstance(self.norm3, RMSNorm),
                 )
+        if drop_self:
+            return hidden_states, residual
         hidden_states = self.mixer(
             hidden_states,
             x_kv=latent_kv,

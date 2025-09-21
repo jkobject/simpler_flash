@@ -186,6 +186,7 @@ class FlashTransformer(nn.Module):
         bias: Tensor | None = None,
         bias_layer: list[int] | None = None,
         mask_zeros: Tensor | None = None,
+        drop_path_rate_self: float = 0.0,
     ) -> Tensor:
         residual = None
         qkvs = []
@@ -203,7 +204,12 @@ class FlashTransformer(nn.Module):
                     self.sketcher_size, dtype=torch.long, device=hidden_states.device
                 ).repeat(hidden_states.shape[0], 1)
             )
+            
         for i, block in enumerate(self.blocks):
+            drop_self = False
+            if drop_path_rate_self > 0.0 and self.training:
+                if torch.rand(1).item() < drop_path_rate_self:
+                    drop_self = True
             hidden_states = block(
                 hidden_states,
                 x_kv,
@@ -212,6 +218,7 @@ class FlashTransformer(nn.Module):
                 return_qkv=(i in return_qkv),
                 bias=bias if i in bias_layer else None,
                 src_key_padding_mask=mask_zeros,
+                drop_self=drop_self,
             )
             if i in return_qkv:
                 qkvs.append(hidden_states[-1])
