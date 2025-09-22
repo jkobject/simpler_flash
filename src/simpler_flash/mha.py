@@ -11,11 +11,10 @@ from einops import rearrange, repeat
 from .hyper_attention import HyperAttention
 
 try:
-    from .flashattention import flash_attn_kvpacked_func, flash_attn_qkvpacked_func
-    from .flashpickattention import (
-        flash_pick_attn_kvpacked_func,
-        flash_pick_attn_qkvpacked_func,
-    )
+    from .flashattention import (flash_attn_kvpacked_func,
+                                 flash_attn_qkvpacked_func)
+    from .flashpickattention import (flash_pick_attn_kvpacked_func,
+                                     flash_pick_attn_qkvpacked_func)
 except ModuleNotFoundError as e:
     print(e)
     print("FlashAttention is not installed, not using it..")
@@ -275,6 +274,7 @@ class SelfAttention(nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = attention_dropout
+        self.drop = nn.Dropout(attention_dropout)
         self.softpick = softpick
 
     def forward(self, qkv, causal=None, bias=None):
@@ -312,13 +312,9 @@ class SelfAttention(nn.Module):
                 )
                 # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
                 scores = scores + causal_mask.to(dtype=scores.dtype)
-            attention = (
-                torch.softmax(scores, dim=-1, dtype=v.dtype)
-                if not self.softpick
-                else softpick(scores, dim=-1)
-            )
+            attention = softpick(scores, dim=-1)
             attention_drop = self.drop(attention)
-            output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+            output = torch.einsum("bhts,bshd->bhtd", attention_drop, v)
         return output
 
 
@@ -341,6 +337,7 @@ class CrossAttention(nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = attention_dropout
+        self.drop = nn.Dropout(attention_dropout)
         self.softpick = softpick
 
     def forward(self, q, kv, causal=None, bias=None):
@@ -379,13 +376,9 @@ class CrossAttention(nn.Module):
                 col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
                 causal_mask = col_idx > row_idx - seqlen_q
                 scores = scores.masked_fill(causal_mask, -10000.0)
-            attention = (
-                torch.softmax(scores, dim=-1, dtype=v.dtype)
-                if not self.softpick
-                else softpick(scores, dim=-1)
-            )
+            attention = softpick(scores, dim=-1)
             attention_drop = self.drop(attention)
-            output = torch.einsum("bhts,bshd->bthd", attention_drop, v)
+            output = torch.einsum("bhts,bshd->bhtd", attention_drop, v)
         return output
 
 

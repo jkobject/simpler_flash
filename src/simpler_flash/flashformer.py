@@ -76,7 +76,7 @@ class FlashTransformer(nn.Module):
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
             drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
             attn_type (str, optional): The attention type. Defaults to "flash".
-                - "flash": Use flash attention (fast)
+                - "legacy-flash": Use flash attention (fast)
                 - "normal": Use regular MHA attention.
                 - "hyper": Use HyperAttention. (not great..)
                 - "criss-cross": Use Criss-Cross attention (even faster)
