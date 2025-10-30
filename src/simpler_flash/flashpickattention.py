@@ -248,7 +248,9 @@ def _fwd_kernel(
         qk_orig += tl.dot(q, tl.trans(k))
 
         if not EVEN_N:  # Mask out padding tokens
-            qk_orig += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
+            qk_orig += tl.where(
+                (start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf")
+            )
         if IS_CAUSAL:  # Mask out future tokens
             qk_orig += tl.where(
                 offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf")
@@ -612,7 +614,8 @@ def _bwd_kernel_one_col_block(
             else:
                 q = tl.load(
                     q_ptrs,
-                    mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                    mask=(offs_m_curr[:, None] < seqlen_q)
+                    & (offs_d[None, :] < headdim),
                     other=0.0,
                 )
 
@@ -804,7 +807,11 @@ def init_to_zero(name):
             pre_hook=init_to_zero("DQ"),
         ),
         triton.Config(
-            {"BLOCK_M": MAXBLOCKSIZE, "BLOCK_N": MAXBLOCKSIZE, "SEQUENCE_PARALLEL": True},
+            {
+                "BLOCK_M": MAXBLOCKSIZE,
+                "BLOCK_N": MAXBLOCKSIZE,
+                "SEQUENCE_PARALLEL": True,
+            },
             num_warps=8,
             num_stages=1,
             pre_hook=init_to_zero("DQ"),

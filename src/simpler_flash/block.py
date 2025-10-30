@@ -269,6 +269,8 @@ class Block(nn.Module):
                     is_rms_norm=isinstance(self.norm3, RMSNorm),
                 )
         if drop_self:
+            if self.mixer.attn_type == "criss-cross":
+                return (hidden_states, residual), latent_kv
             return hidden_states, residual
         hidden_states = self.mixer(
             hidden_states,

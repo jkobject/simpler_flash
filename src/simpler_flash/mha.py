@@ -6,15 +6,18 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from adasplash import adasplash
 from einops import rearrange, repeat
 
 from .hyper_attention import HyperAttention
 
 try:
-    from .flashattention import (flash_attn_kvpacked_func,
-                                 flash_attn_qkvpacked_func)
-    from .flashpickattention import (flash_pick_attn_kvpacked_func,
-                                     flash_pick_attn_qkvpacked_func)
+    from .flashattention import flash_attn_kvpacked_func, flash_attn_qkvpacked_func
+    from .flashpickattention import (
+        flash_pick_attn_kvpacked_func,
+        flash_pick_attn_qkvpacked_func,
+    )
+    from .og_flashsoftpick import parallel_softpick_attn
 except ModuleNotFoundError as e:
     print(e)
     print("FlashAttention is not installed, not using it..")
@@ -269,6 +272,7 @@ class SelfAttention(nn.Module):
         softmax_scale=None,
         attention_dropout=0.0,
         softpick: bool = False,
+        adasplash: bool = False,
     ):
         super().__init__()
         self.causal = causal
@@ -276,8 +280,9 @@ class SelfAttention(nn.Module):
         self.dropout = attention_dropout
         self.drop = nn.Dropout(attention_dropout)
         self.softpick = softpick
+        self.adasplash = adasplash
 
-    def forward(self, qkv, causal=None, bias=None):
+    def forward(self, qkv, causal=None, bias=None, alpha=1.5):
         """
         Implements the multihead softmax attention.
 
@@ -287,6 +292,10 @@ class SelfAttention(nn.Module):
         """
         causal = self.causal if causal is None else causal
         q, k, v = qkv.transpose(1, 3).unbind(dim=2)
+        if self.adasplash:
+            output = adasplash(
+                q, k, v, alpha=alpha, niter=10, is_causal=causal, varlen=False
+            )
 
         if not self.softpick:
             if bias is not None:
@@ -332,6 +341,7 @@ class CrossAttention(nn.Module):
         softmax_scale=None,
         attention_dropout=0.0,
         softpick: bool = False,
+        adasplash: bool = False,
     ):
         super().__init__()
         self.causal = causal
@@ -339,8 +349,9 @@ class CrossAttention(nn.Module):
         self.dropout = attention_dropout
         self.drop = nn.Dropout(attention_dropout)
         self.softpick = softpick
+        self.adasplash = adasplash
 
-    def forward(self, q, kv, causal=None, bias=None):
+    def forward(self, q, kv, causal=None, bias=None, alpha=1.5):
         """Implements the multihead softmax attention.
 
         Args
@@ -356,6 +367,10 @@ class CrossAttention(nn.Module):
             kv = repeat(kv, "... hkv d -> ... (hkv g) d", g=q.shape[2] // kv.shape[3])
         k, v = kv.transpose(1, 3).unbind(dim=2)
         q = q.transpose(1, 2)
+        if self.adasplash:
+            output = adasplash(
+                q, k, v, alpha=alpha, niter=10, is_causal=causal, varlen=False
+            )
         if not self.softpick:
             output = nn.functional.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.dropout, is_causal=causal
@@ -371,7 +386,8 @@ class CrossAttention(nn.Module):
             if causal:
                 # causal mask needs to take into account the difference between seqlen_q and seqlen_k
                 row_idx = rearrange(
-                    torch.arange(seqlen_q, device=q.device, dtype=torch.long), "s -> s 1"
+                    torch.arange(seqlen_q, device=q.device, dtype=torch.long),
+                    "s -> s 1",
                 )
                 col_idx = torch.arange(seqlen_k, device=kv.device, dtype=torch.long)
                 causal_mask = col_idx > row_idx - seqlen_q
@@ -528,7 +544,9 @@ class MHA(nn.Module):
         assert (
             self.num_heads % self.num_heads_kv == 0
         ), "num_heads must be divisible by num_heads_kv"
-        assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert (
+            self.embed_dim % num_heads == 0
+        ), "embed_dim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
         kv_dim = 2 * self.head_dim * self.num_heads_kv
@@ -599,7 +617,9 @@ class MHA(nn.Module):
             )
 
         if not self.cross_attn:
-            self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wqkv = wqkv_cls(
+                embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs
+            )
         else:
             self.Wq = linear_cls(
                 embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs
@@ -829,7 +849,9 @@ class MHA(nn.Module):
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv)
+                        context = torch.utils.checkpoint.checkpoint(
+                            self.inner_attn, qkv
+                        )
                 else:
                     context = self._update_kvcache_attention(
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
@@ -868,7 +890,9 @@ class MHA(nn.Module):
                         d=self.head_dim,
                     )
             q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-            kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+            kv = rearrange(
+                kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim
+            )
             # TODO: to change for criss-cross
 
             if self.dwconv:
@@ -928,7 +952,9 @@ class MHA(nn.Module):
                 qkv = torch.cat(
                     [
                         q.unsqueeze(2),
-                        kv.repeat_interleave(self.num_heads // self.num_heads_kv, dim=3),
+                        kv.repeat_interleave(
+                            self.num_heads // self.num_heads_kv, dim=3
+                        ),
                     ],
                     dim=2,
                 )
@@ -949,4 +975,6 @@ class MHA(nn.Module):
         if return_qkv:
             return out if not self.return_residual else (out, x), qkv
         else:
+            return out if not self.return_residual else (out, x)
+            return out if not self.return_residual else (out, x)
             return out if not self.return_residual else (out, x)

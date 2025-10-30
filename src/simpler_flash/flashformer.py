@@ -102,7 +102,9 @@ class FlashTransformer(nn.Module):
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, nlayers)
         ]  # stochastic depth decay rule
-
+        softpick = attn_type in ["softpick", "flash-softpick"]
+        attn = attn_type if attn_type != "softpick" else "normal"
+        attn = "flash" if attn_type == "flash-softpick" else attn
         for i in range(nlayers):
             mlp = create_mlp_cls(d_model, mlp_ratio, nn.GELU, fused_mlp)
             if cross_attn:
@@ -113,13 +115,11 @@ class FlashTransformer(nn.Module):
                     dropout=dropout,
                     attn_dropout=attn_dropout,
                     causal=False,
-                    attn_type=attn_type
-                    if attn_type not in ["softpick", "criss-cross"]
-                    else "normal",
+                    attn_type=attn if attn_type != "criss-cross" else "normal",
                     layer_idx=(i * 2),
                     cross_attn=True,
                     cross_dim=cross_dim,
-                    softpick=attn_type == "softpick",
+                    softpick=softpick,
                 )
             else:
                 cross_attention = None
@@ -129,14 +129,14 @@ class FlashTransformer(nn.Module):
                 num_heads_kv=num_heads_kv,
                 dropout=dropout,
                 causal=False,
-                attn_type=attn_type if attn_type != "softpick" else "normal",
+                attn_type=attn,
                 cross_attn=False,
                 checkpointing=checkpointing,
                 fused_bias_fc=fused_bias_fc,
                 layer_idx=i if not cross_attn else (i * 2) + 1,
                 sketcher_dim=sketcher_dim,
                 attn_dropout=attn_dropout,
-                softpick=attn_type == "softpick",
+                softpick=softpick,
                 **mha_kwargs,
             )
             # or use parallelBlock where attn & MLP are done in parallel
@@ -204,7 +204,7 @@ class FlashTransformer(nn.Module):
                     self.sketcher_size, dtype=torch.long, device=hidden_states.device
                 ).repeat(hidden_states.shape[0], 1)
             )
-            
+
         for i, block in enumerate(self.blocks):
             drop_self = False
             if drop_path_rate_self > 0.0 and self.training:
