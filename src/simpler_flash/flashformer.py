@@ -81,6 +81,7 @@ class FlashTransformer(nn.Module):
                 - "hyper": Use HyperAttention. (not great..)
                 - "criss-cross": Use Criss-Cross attention (even faster)
                 - "softpick": Use SoftPick attention. (really not great...)
+                - "flash-softpick": use efficient softpick attention
             weight_init (str, optional): The weight initialization method. Defaults to "".
             sketcher_size (int, optional): The size of the sketcher. Defaults to 200.
             sketcher_dim (int, optional): The dimension of the sketcher. Defaults to 128.

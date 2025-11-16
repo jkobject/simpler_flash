@@ -893,8 +893,6 @@ class MHA(nn.Module):
             kv = rearrange(
                 kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim
             )
-            # TODO: to change for criss-cross
-
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2],
