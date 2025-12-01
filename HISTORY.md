@@ -4,6 +4,12 @@ Changelog
 
 (unreleased)
 ------------
+- Cleanup. [jkobject]
+
+
+1.3.2 (2025-12-01)
+------------------
+- Release: version 1.3.2 🚀 [jkobject]
 - Cleaning. [jkobject]
 - Wip on flashpick attn and debug criss-cross. [jkobject]
 - Debug softpick. [jkobject]
