@@ -248,9 +248,7 @@ def _fwd_kernel(
         qk_orig += tl.dot(q, tl.trans(k))
 
         if not EVEN_N:  # Mask out padding tokens
-            qk_orig += tl.where(
-                (start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf")
-            )
+            qk_orig += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
         if IS_CAUSAL:  # Mask out future tokens
             qk_orig += tl.where(
                 offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf")
@@ -614,8 +612,7 @@ def _bwd_kernel_one_col_block(
             else:
                 q = tl.load(
                     q_ptrs,
-                    mask=(offs_m_curr[:, None] < seqlen_q)
-                    & (offs_d[None, :] < headdim),
+                    mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                     other=0.0,
                 )
 
@@ -1011,9 +1008,9 @@ def _flash_attn_forward(
     _, seqlen_k, nheads, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    assert (
-        d <= MAXBLOCKSIZE
-    ), "FlashAttention only support head dimensions up to MAXBLOCKSIZE"
+    assert d <= MAXBLOCKSIZE, (
+        "FlashAttention only support head dimensions up to MAXBLOCKSIZE"
+    )
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -1259,9 +1256,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         qkv, o, lse, bias = ctx.saved_tensors
-        assert not ctx.needs_input_grad[
-            1
-        ], "FlashAttention does not support bias gradient yet"
+        assert not ctx.needs_input_grad[1], (
+            "FlashAttention does not support bias gradient yet"
+        )
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():
@@ -1330,9 +1327,9 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     def backward(ctx, do):
         q, kv, o, lse, bias = ctx.saved_tensors
         if len(ctx.needs_input_grad) >= 3:
-            assert not ctx.needs_input_grad[
-                2
-            ], "FlashAttention does not support bias gradient yet"
+            assert not ctx.needs_input_grad[2], (
+                "FlashAttention does not support bias gradient yet"
+            )
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():

@@ -76,7 +76,7 @@ release:          ## Create a new tag for release.
 	@git tag $${TAG}
 	@git push -u origin HEAD --tags
 	@uv build
-	@uv release
+	@uv publish
 	@echo "Github Actions will detect the new tag and release the new version."
 	@mkdocs gh-deploy
 	@echo "also pushed the documentation website"

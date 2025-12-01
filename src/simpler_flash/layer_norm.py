@@ -691,9 +691,9 @@ def _layer_norm_bwd(
     dx1 = torch.empty_like(dx) if (has_x1 and dropout_p > 0.0) else None
     y = torch.empty(M, N, dtype=dy.dtype, device=dy.device) if recompute_output else None
     if recompute_output:
-        assert (
-            weight1 is None
-        ), "recompute_output is not supported with parallel LayerNorm"
+        assert weight1 is None, (
+            "recompute_output is not supported with parallel LayerNorm"
+        )
 
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()

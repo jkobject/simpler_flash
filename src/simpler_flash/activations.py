@@ -13,7 +13,9 @@ import torch.nn.functional as F
 @torch.jit.script
 def bias_gelu(y, bias):
     x = bias + y
-    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))).to(dtype=y.dtype)
+    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))).to(
+        dtype=y.dtype
+    )
 
 
 # gradient of tanh approximation of gelu
@@ -25,7 +27,9 @@ def bias_gelu_back(g, y, bias):
     x = bias + y
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
-    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
+    ff = 0.5 * x * (
+        (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
+    ) + 0.5 * (1 + tanh_out)
     grad_y = ff * g
     return grad_y.to(dtype=y.dtype), grad_y.sum(dim=(0), dtype=bias.dtype)
 
@@ -52,7 +56,9 @@ bias_gelu_impl = GeLUFunction.apply
 # x * 0.5 * (1.0 + torch.erf(x * 0.70710678))
 @torch.jit.script
 def gelu_fwd(x):
-    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))).to(dtype=x.dtype)
+    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))).to(
+        dtype=x.dtype
+    )
 
 
 # gradient of tanh approximation of gelu
@@ -62,7 +68,9 @@ def gelu_fwd(x):
 def gelu_bwd(g, x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
-    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
+    ff = 0.5 * x * (
+        (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
+    ) + 0.5 * (1 + tanh_out)
     return (ff * g).to(dtype=x.dtype)
 
 
@@ -112,7 +120,9 @@ template <typename T> T swiglu_bwd(T x, T y, T g, T& dx, T& dy) {
 }
 """
 swiglu_fwd = torch.cuda.jiterator._create_jit_fn(swiglu_fwd_codestring)
-swiglu_bwd = torch.cuda.jiterator._create_multi_output_jit_fn(swiglu_bwd_codestring, num_outputs=2)
+swiglu_bwd = torch.cuda.jiterator._create_multi_output_jit_fn(
+    swiglu_bwd_codestring, num_outputs=2
+)
 
 
 class SwiGLUFunction(torch.autograd.Function):

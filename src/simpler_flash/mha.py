@@ -17,7 +17,8 @@ try:
         flash_pick_attn_kvpacked_func,
         flash_pick_attn_qkvpacked_func,
     )
-    from .og_flashsoftpick import parallel_softpick_attn
+
+    # from .og_flashsoftpick import parallel_softpick_attn
 except ModuleNotFoundError as e:
     print(e)
     print("FlashAttention is not installed, not using it..")
@@ -541,20 +542,18 @@ class MHA(nn.Module):
 
         self.num_heads = num_heads
         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
-        assert (
-            self.num_heads % self.num_heads_kv == 0
-        ), "num_heads must be divisible by num_heads_kv"
-        assert (
-            self.embed_dim % num_heads == 0
-        ), "embed_dim must be divisible by num_heads"
+        assert self.num_heads % self.num_heads_kv == 0, (
+            "num_heads must be divisible by num_heads_kv"
+        )
+        assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
         kv_dim = 2 * self.head_dim * self.num_heads_kv
 
         if self.rotary_emb_dim > 0:
-            assert (
-                not cross_attn
-            ), "MHA with rotary embedding does not support cross-attention yet"
+            assert not cross_attn, (
+                "MHA with rotary embedding does not support cross-attention yet"
+            )
             assert RotaryEmbedding is not None, "rotary_emb is not installed"
             self.rotary_emb = RotaryEmbedding(
                 self.rotary_emb_dim,
@@ -617,9 +616,7 @@ class MHA(nn.Module):
             )
 
         if not self.cross_attn:
-            self.Wqkv = wqkv_cls(
-                embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs
-            )
+            self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         else:
             self.Wq = linear_cls(
                 embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs
@@ -671,9 +668,9 @@ class MHA(nn.Module):
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
         assert not self.dwconv, "Generation does not support dwconv yet"
-        assert (
-            self.layer_idx is not None
-        ), "Generation requires layer_idx in the constructor"
+        assert self.layer_idx is not None, (
+            "Generation requires layer_idx in the constructor"
+        )
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
     def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
@@ -849,9 +846,7 @@ class MHA(nn.Module):
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(
-                            self.inner_attn, qkv
-                        )
+                        context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv)
                 else:
                     context = self._update_kvcache_attention(
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
@@ -890,9 +885,7 @@ class MHA(nn.Module):
                         d=self.head_dim,
                     )
             q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-            kv = rearrange(
-                kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim
-            )
+            kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2],
@@ -950,9 +943,7 @@ class MHA(nn.Module):
                 qkv = torch.cat(
                     [
                         q.unsqueeze(2),
-                        kv.repeat_interleave(
-                            self.num_heads // self.num_heads_kv, dim=3
-                        ),
+                        kv.repeat_interleave(self.num_heads // self.num_heads_kv, dim=3),
                     ],
                     dim=2,
                 )
