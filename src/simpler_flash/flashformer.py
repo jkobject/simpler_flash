@@ -63,33 +63,35 @@ class FlashTransformer(nn.Module):
             d_model (int): The dimension of the input vectors.
             nhead (int): The number of attention heads.
             nlayers (int): The number of layers in the transformer.
-            dropout (float, optional): The dropout rate to apply to the output of the positional encoding. Defaults to 0.1.
+            num_heads_kv (int | None, optional): The number of heads for key/value. Defaults to None.
+            dropout (float, optional): The dropout rate to apply to the output. Defaults to 0.1.
+            attn_dropout (float, optional): The dropout rate for attention weights. Defaults to 0.0.
+            cross_attn (bool, optional): Whether to use cross-attention (decoder mode). Defaults to False.
             residual_in_fp32 (bool, optional): Whether to force the residual to be in fp32 format. Defaults to True.
-            num_heads_kv (_type_, optional): The number of heads for key/value. Defaults to None.
             checkpointing (bool, optional): Whether to use gradient checkpointing. Defaults to False.
             fused_dropout_add_ln (bool, optional): Whether to fuse dropout, addition and layer normalization operations. Defaults to False.
             return_residual (bool, optional): Whether to return the residual. Defaults to False.
-            mlp_ratio (float, optional): The ratio for MLP. Defaults to 4.0.
+            mlp_ratio (float, optional): The ratio for MLP hidden dimension. Defaults to 4.0.
             fused_mlp (bool, optional): Whether to use fused MLP. Defaults to False.
             fused_bias_fc (bool, optional): Whether to fuse bias and fully connected layers. Defaults to False.
-            cross_dim (int, optional): The dimension of the cross-attention. Defaults to 128.
             sequence_parallel (bool, optional): Whether to use sequence parallelism. Defaults to False.
-            drop_path_rate (float, optional): The drop path rate. Defaults to 0.0.
+            drop_path_rate (float, optional): The drop path rate for stochastic depth. Defaults to 0.0.
             attn_type (str, optional): The attention type. Defaults to "flash".
-                - "legacy-flash": Use flash attention (fast)
+                - "flash": Use flash attention (fast)
                 - "normal": Use regular MHA attention.
-                - "hyper": Use HyperAttention. (not great..)
+                - "hyper": Use HyperAttention.
                 - "criss-cross": Use Criss-Cross attention (even faster)
-                - "softpick": Use SoftPick attention. (really not great...)
-                - "flash-softpick": use efficient softpick attention
+                - "softpick": Use SoftPick attention.
+                - "flash-softpick": Use efficient softpick attention
             weight_init (str, optional): The weight initialization method. Defaults to "".
-            sketcher_size (int, optional): The size of the sketcher. Defaults to 200.
-            sketcher_dim (int, optional): The dimension of the sketcher. Defaults to 128.
+            sketcher_size (int, optional): The size of the sketcher for criss-cross attention. Defaults to 200.
+            sketcher_dim (int, optional): The dimension of the sketcher for criss-cross attention. Defaults to 128.
+            cross_dim (int, optional): The dimension of the cross-attention. Defaults to 128.
+            **mha_kwargs: Additional keyword arguments passed to MHA layers.
 
-        Raises
-        ------
+        Raises:
             ImportError: Raised when Triton is not installed but fused_dropout_add_ln is set to True.
-            NotImplementedError: Raised when an unsupported operation is attempted.
+            NotImplementedError: Raised when sequence_parallel is set to True.
         """
         super(FlashTransformer, self).__init__()
         self.cross_attn = cross_attn

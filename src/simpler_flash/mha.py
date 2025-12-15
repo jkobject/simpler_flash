@@ -480,40 +480,64 @@ class MHA(nn.Module):
         softpick: bool = False,
         attn_dropout: float = 0,
     ) -> None:
-        """
-        MHA Multi-head self-attention and cross-attention
+        """Multi-Head Attention with support for various attention mechanisms.
+
+        Supports standard MHA, Multi-Query Attention (MQA), Grouped-Query Attention (GQA),
+        FlashAttention, HyperAttention, cross-attention, and criss-cross attention.
 
         Args:
-            embed_dim
-            num_heads_kv (int): can be used to toggle MQA / GQA. If None, use num_heads.
-            return_residual (bool, optional): whether to return the input x along with the output. This is for
-                performance reason: for post-norm architecture, returning the input allows us
-                to fuse the backward of nn.Linear with the residual connection.
+            embed_dim (int): Embedding dimension of the input.
+            num_heads (int): Number of attention heads.
+            num_heads_kv (int | None, optional): Number of key-value heads for MQA/GQA.
+                If None, uses num_heads for standard MHA. Defaults to None.
+            cross_attn (bool, optional): Whether to use cross-attention instead of self-attention.
                 Defaults to False.
-            checkpointing (bool, optional): whether to use checkpointing to save memory.
+            qkv_proj_bias (bool, optional): Whether to include bias in QKV projection layers.
+                Defaults to True.
+            out_proj_bias (bool, optional): Whether to include bias in output projection layer.
+                Defaults to True.
+            dropout (float, optional): Dropout rate applied after attention. Defaults to 0.0.
+            softmax_scale (float | None, optional): Temperature for softmax attention.
+                If None, uses 1/sqrt(head_dim). Defaults to None.
+            causal (bool, optional): Whether to apply causal masking. Defaults to False.
+            layer_idx (int | None, optional): Layer index for caching during inference.
+                Required for generation. Defaults to None.
+            dwconv (bool, optional): Whether to apply depthwise convolution to QKV.
                 Defaults to False.
-            num_heads_kv (int, optional): can be used to toggle MQA / GQA. If None, use num_heads.
-            cross_attn (bool, optional): whether to use cross-attention. Defaults to False.
-            qkv_proj_bias (bool, optional): whether to use bias in the query, key, value projection. Defaults to True.
-            out_proj_bias (bool, optional): whether to use bias in the output projection. Defaults to True.
-            dropout (float, optional): dropout rate. Defaults to 0.0.
-            softmax_scale (float, optional): The temperature to use for the softmax attention.
-            cross_dim (int, optional): dimension of the cross-attention element
-            causal (bool, optional): whether to use causal attention. Defaults to False.
-            layer_idx (int, optional): layer index for inference cache. Defaults to None.
-            dwconv (bool, optional): whether to use depthwise convolution. Defaults to False.
-            fused_bias_fc (bool, optional): whether to use fused_bias_fc. Defaults to False.
-            attn_type (str, optional): whether to use FlashAttention. Defaults to "flash".
-                - "flash": Use flash attention.
-                - "normal": Use regular MHA attention.
-                - "hyper": Use HyperAttention.
-                - "criss-cross": Use Criss-Cross attention.
-            device (torch.device, optional): device. Defaults to None.
-            dtype (torch.dtype, optional): dtype. Defaults to None.
-            num_lsh_projections (int, optional): number of LSH projections in HyperAttention. Defaults to 8.
-            block_size (int, optional): block size for LSH in HyperAttention. Defaults to 128.
-            attn_dropout (float, optional): the amount of dropout in the attention matrices.
-            sketcher_dim (int, optional): dimension of the sketcher. Defaults to 128.
+            rotary_emb_dim (int, optional): Dimension for rotary position embeddings.
+                If 0, rotary embeddings are disabled. Defaults to 0.
+            rotary_emb_base (float, optional): Base value for rotary embeddings. Defaults to 10000.0.
+            rotary_emb_scale_base (float | None, optional): Scale base for xPos rotary embeddings.
+                Defaults to None.
+            rotary_emb_interleaved (bool, optional): Whether to use interleaved rotary embeddings.
+                Defaults to False.
+            use_alibi (bool, optional): Whether to use ALiBi position embeddings. Defaults to False.
+            fused_bias_fc (bool, optional): Whether to use fused bias operations for efficiency.
+                Requires FusedDense. Defaults to False.
+            attn_type (str, optional): Type of attention mechanism to use. Options:
+                - "flash": FlashAttention2 (GPU-optimized).
+                - "normal": Standard PyTorch attention now uses flashattention3.
+                - "hyper": HyperAttention (LSH-based).
+                - "criss-cross": Criss-cross attention pattern.
+                Defaults to "flash".
+            return_residual (bool, optional): Whether to return input residual along with output.
+                Useful for fusing operations in post-norm architectures. Defaults to False.
+            checkpointing (bool, optional): Whether to use gradient checkpointing to save memory.
+                Defaults to False.
+            device (torch.device | None, optional): Device for tensor allocation. Defaults to None.
+            dtype (torch.dtype | None, optional): Data type for tensor allocation. Defaults to None.
+            num_lsh_projections (int, optional): Number of LSH projections for HyperAttention.
+                Defaults to 8.
+            block_size (int, optional): Block size for LSH bucketing in HyperAttention.
+                Defaults to 128.
+            sketcher_dim (int, optional): Dimension of the sketcher for criss-cross attention.
+                Defaults to 128.
+            cross_dim (int, optional): Input dimension for cross-attention key/value.
+                Defaults to 128.
+            softpick (bool, optional): Whether to use softpick activation instead of softmax.
+                Defaults to False. works only with normal and flash attention.
+            attn_dropout (float, optional): Dropout rate applied to attention weights.
+                Defaults to 0.0.
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -542,18 +566,20 @@ class MHA(nn.Module):
 
         self.num_heads = num_heads
         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
-        assert self.num_heads % self.num_heads_kv == 0, (
-            "num_heads must be divisible by num_heads_kv"
-        )
-        assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert (
+            self.num_heads % self.num_heads_kv == 0
+        ), "num_heads must be divisible by num_heads_kv"
+        assert (
+            self.embed_dim % num_heads == 0
+        ), "embed_dim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
         kv_dim = 2 * self.head_dim * self.num_heads_kv
 
         if self.rotary_emb_dim > 0:
-            assert not cross_attn, (
-                "MHA with rotary embedding does not support cross-attention yet"
-            )
+            assert (
+                not cross_attn
+            ), "MHA with rotary embedding does not support cross-attention yet"
             assert RotaryEmbedding is not None, "rotary_emb is not installed"
             self.rotary_emb = RotaryEmbedding(
                 self.rotary_emb_dim,
@@ -616,7 +642,9 @@ class MHA(nn.Module):
             )
 
         if not self.cross_attn:
-            self.Wqkv = wqkv_cls(embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
+            self.Wqkv = wqkv_cls(
+                embed_dim, qkv_dim, bias=qkv_proj_bias, **factory_kwargs
+            )
         else:
             self.Wq = linear_cls(
                 embed_dim, embed_dim, bias=qkv_proj_bias, **factory_kwargs
@@ -668,9 +696,9 @@ class MHA(nn.Module):
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
         assert not self.dwconv, "Generation does not support dwconv yet"
-        assert self.layer_idx is not None, (
-            "Generation requires layer_idx in the constructor"
-        )
+        assert (
+            self.layer_idx is not None
+        ), "Generation requires layer_idx in the constructor"
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
     def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
@@ -846,7 +874,9 @@ class MHA(nn.Module):
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
                     else:
-                        context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv)
+                        context = torch.utils.checkpoint.checkpoint(
+                            self.inner_attn, qkv
+                        )
                 else:
                     context = self._update_kvcache_attention(
                         qkv[:, :, 0], qkv[:, :, 1:], inference_params
@@ -885,7 +915,9 @@ class MHA(nn.Module):
                         d=self.head_dim,
                     )
             q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-            kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+            kv = rearrange(
+                kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim
+            )
             if self.dwconv:
                 q = rearrange(
                     self.dwconv_q(rearrange(q, "b s d -> b d s"))[..., :-2],
@@ -943,7 +975,9 @@ class MHA(nn.Module):
                 qkv = torch.cat(
                     [
                         q.unsqueeze(2),
-                        kv.repeat_interleave(self.num_heads // self.num_heads_kv, dim=3),
+                        kv.repeat_interleave(
+                            self.num_heads // self.num_heads_kv, dim=3
+                        ),
                     ],
                     dim=2,
                 )
