@@ -4,6 +4,15 @@ Changelog
 
 (unreleased)
 ------------
+- Debug a layernorm warning. [jkobject]
+- Cleanups. [jkobject]
+- Better doc. [jkobject]
+- Dbug. [jkobject]
+
+
+1.3.3 (2025-12-01)
+------------------
+- Release: version 1.3.3 🚀 [jkobject]
 - Cleanup. [jkobject]
 
 
