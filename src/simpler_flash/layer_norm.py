@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 
 
 def layer_norm_ref(
@@ -597,7 +597,8 @@ def _layer_norm_bwd_kernel(
             tl.store(DX1 + cols, dx1, mask=mask)
         if HAS_DROPOUT:
             keep_mask = (
-                tl.rand(tl.load(SEEDS + row).to(tl.uint32), cols, n_rounds=7) > dropout_p
+                tl.rand(tl.load(SEEDS + row).to(tl.uint32), cols, n_rounds=7)
+                > dropout_p
             )
             dx = tl.where(keep_mask, dx / (1.0 - dropout_p), 0.0)
         if HAS_ROWSCALE:
@@ -689,11 +690,15 @@ def _layer_norm_bwd(
         else None
     )
     dx1 = torch.empty_like(dx) if (has_x1 and dropout_p > 0.0) else None
-    y = torch.empty(M, N, dtype=dy.dtype, device=dy.device) if recompute_output else None
+    y = (
+        torch.empty(M, N, dtype=dy.dtype, device=dy.device)
+        if recompute_output
+        else None
+    )
     if recompute_output:
-        assert weight1 is None, (
-            "recompute_output is not supported with parallel LayerNorm"
-        )
+        assert (
+            weight1 is None
+        ), "recompute_output is not supported with parallel LayerNorm"
 
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -1041,7 +1046,7 @@ class RMSNorm(torch.nn.Module):
 
 class LayerNormLinearFn(torch.autograd.Function):
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(
         ctx,
         x,
@@ -1079,14 +1084,18 @@ class LayerNormLinearFn(torch.autograd.Function):
             norm_bias,
             eps,
             residual,
-            out_dtype=None
-            if not torch.is_autocast_enabled()
-            else torch.get_autocast_gpu_dtype(),
+            out_dtype=(
+                None
+                if not torch.is_autocast_enabled()
+                else torch.get_autocast_gpu_dtype()
+            ),
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
         )
         y = y.reshape(x_shape_og)
-        dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
+        dtype = (
+            torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
+        )
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
@@ -1104,7 +1113,7 @@ class LayerNormLinearFn(torch.autograd.Function):
         return out if not prenorm else (out, residual_out.reshape(x_shape_og))
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dout, *args):
         x, norm_weight, norm_bias, linear_weight, mean, rstd = ctx.saved_tensors
         dout = dout.reshape(-1, dout.shape[-1])
