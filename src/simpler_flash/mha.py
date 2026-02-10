@@ -6,17 +6,17 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from adasplash import adasplash
 from einops import rearrange, repeat
 
-from .hyper_attention import HyperAttention
-
 try:
+    from adasplash import adasplash
+
     from .flashattention import flash_attn_kvpacked_func, flash_attn_qkvpacked_func
     from .flashpickattention import (
         flash_pick_attn_kvpacked_func,
         flash_pick_attn_qkvpacked_func,
     )
+    from .hyper_attention import HyperAttention
 
     # from .og_flashsoftpick import parallel_softpick_attn
 except ModuleNotFoundError as e:
@@ -26,7 +26,9 @@ except ModuleNotFoundError as e:
     flash_attn_kvpacked_func = None
     flash_attn_qkvpacked_func = None
     flash_pick_attn_qkvpacked_func = None
+    adasplash = None
     flash_pick_attn_kvpacked_func = None
+    HyperAttention = None
 
 # from .flashattention_triton import attention as triton_attention
 
@@ -49,6 +51,8 @@ class HyperSelfAttention(nn.Module):
     ):
         super().__init__()
         self.causal = causal
+        if HyperAttention is None:
+            raise ImportError("HyperAttention is not installed, cannot use it")
         self.hyper_attention = HyperAttention(
             input_dim=head_dim,
             lsh_num_projs=lsh_num_projs,
@@ -294,6 +298,8 @@ class SelfAttention(nn.Module):
         causal = self.causal if causal is None else causal
         q, k, v = qkv.transpose(1, 3).unbind(dim=2)
         if self.adasplash:
+            if adasplash is None:
+                raise ValueError("adasplash is not installed, cannot use it")
             output = adasplash(
                 q, k, v, alpha=alpha, niter=10, is_causal=causal, varlen=False
             )
@@ -369,6 +375,8 @@ class CrossAttention(nn.Module):
         k, v = kv.transpose(1, 3).unbind(dim=2)
         q = q.transpose(1, 2)
         if self.adasplash:
+            if adasplash is None:
+                raise ValueError("adasplash is not installed, cannot use it")
             output = adasplash(
                 q, k, v, alpha=alpha, niter=10, is_causal=causal, varlen=False
             )
