@@ -37,7 +37,6 @@ dependencies = [
   "torchtext>=0.17",
   "torchvision>=0.17",
   "setuptools>=58.0.0",
-  "triton==3.4.0",
 ]
 
 optional-dependencies.dev = [
@@ -54,6 +53,10 @@ optional-dependencies.dev = [
     "mkdocstrings-python>=0.10.0"
 ]
 
+optional-dependencies.flash = [
+  "triton==3.4.0",
+]
+
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://simpler_flash.readthedocs.io/"
 urls.Homepage = "https://github.com/jkobject/simpler_flash"
@@ -61,7 +64,7 @@ urls.Source = "https://github.com/jkobject/simpler_flash"
 
 [tool.hatch.envs.default]
 installer = "uv"
-features = [ "dev" ]
+features = [ "dev", "flash" ]
 installer-args = [
   "--index-url",
   "https://pypi.ngc.nvidia.com",
