@@ -49,7 +49,7 @@ class FlashTransformer(nn.Module):
         fused_bias_fc: bool = False,
         sequence_parallel: bool = False,
         drop_path_rate: float = 0.0,
-        attn_type: str = "flash",
+        attn_type: str = "normal",
         weight_init: str = "",
         sketcher_size: int = 200,
         sketcher_dim: int = 128,
@@ -89,7 +89,8 @@ class FlashTransformer(nn.Module):
             cross_dim (int, optional): The dimension of the cross-attention. Defaults to 128.
             **mha_kwargs: Additional keyword arguments passed to MHA layers.
 
-        Raises:
+        Raises
+        ------
             ImportError: Raised when Triton is not installed but fused_dropout_add_ln is set to True.
             NotImplementedError: Raised when sequence_parallel is set to True.
         """

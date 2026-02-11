@@ -1882,10 +1882,9 @@ wheels = [
 
 [[package]]
 name = "simpler-flash"
-version = "1.2.0"
+version = "1.3.4"
 source = { editable = "." }
 dependencies = [
-    { name = "adasplash" },
     { name = "einops" },
     { name = "performer-pytorch" },
     { name = "session-info" },
@@ -1895,7 +1894,6 @@ dependencies = [
     { name = "torchdata" },
     { name = "torchtext" },
     { name = "torchvision" },
-    { name = "triton" },
 ]
 
 [package.optional-dependencies]
@@ -1912,10 +1910,14 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
+flash = [
+    { name = "adasplash" },
+    { name = "triton" },
+]
 
 [package.metadata]
 requires-dist = [
-    { name = "adasplash" },
+    { name = "adasplash", marker = "extra == 'flash'" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.3.2" },
     { name = "einops", specifier = ">=0.6.1" },
     { name = "gitchangelog", marker = "extra == 'dev'", specifier = ">=3.0.4" },
@@ -1936,7 +1938,7 @@ requires-dist = [
     { name = "torchdata", specifier = ">=0.5" },
     { name = "torchtext", specifier = ">=0.17" },
     { name = "torchvision", specifier = ">=0.17" },
-    { name = "triton", specifier = "==3.4.0" },
+    { name = "triton", marker = "extra == 'flash'", specifier = "==3.4.0" },
 ]
 
 [[package]]
