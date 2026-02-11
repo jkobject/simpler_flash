@@ -4,6 +4,15 @@ Changelog
 
 (unreleased)
 ------------
+- Adding a test. [jkobject]
+- Solving other issues. [jkobject]
+- Triton as an optional import. [jkobject]
+- Site. [jkobject]
+
+
+1.3.4 (2026-01-28)
+------------------
+- Release: version 1.3.4 🚀 [jkobject]
 - Debug a layernorm warning. [jkobject]
 - Cleanups. [jkobject]
 - Better doc. [jkobject]
