@@ -1,7 +1,4 @@
-# simpler_flash
-
-[![Tests][badge-tests]][tests]
-[![Documentation][badge-docs]][documentation]
+# A simpler flash attention package
 
 [![codecov](https://codecov.io/gh/jkobject/simpler_flash/graph/badge.svg?token=3W3Y1VKWBH)](https://codecov.io/gh/jkobject/simpler_flash)
 [![CI](https://github.com/jkobject/simpler_flash/actions/workflows/main.yml/badge.svg)](https://github.com/jkobject/simpler_flash/actions/workflows/main.yml)
